@@ -456,6 +456,14 @@ pub(crate) mod tests {
     }
 }
 
+/// An exact `1/N` rational for a sub-second value whose reciprocal is a whole number (shutter speeds such as
+/// 1/12800 s, which [`lightcraft_tiff::writer::rational`]'s decimal denominators cannot represent).
+fn reciprocal(v: Option<f64>) -> Option<lightcraft_tiff::Value> {
+    let v = v.filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)?;
+    let inv = 1.0 / v;
+    ((inv - inv.round()).abs() < 1e-6 && inv.round() <= u32::MAX as f64).then(|| lightcraft_tiff::Value::Rational(vec![(1, inv.round() as u32)]))
+}
+
 /// Serialise the interchange subset of `meta` as a TIFF-structured Exif block (little-endian, no
 /// `Exif\0\0` prefix): IFD0 (make, model, software, artist, copyright, description, orientation,
 /// date), the Exif IFD (capture settings, lens) and, when present, the GPS IFD.
@@ -483,7 +491,7 @@ pub fn write_exif(meta: &Metadata) -> Vec<u8> {
     let r = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0).map(|v| Value::Rational(vec![rational(v)]));
     for (tag, v) in [
         (t::DATE_TIME_ORIGINAL, meta.capture_time.map(|d| Value::Ascii(d.to_exif()))),
-        (t::EXPOSURE_TIME, r(meta.exposure_time)),
+        (t::EXPOSURE_TIME, reciprocal(meta.exposure_time).or_else(|| r(meta.exposure_time))),
         (t::F_NUMBER, r(meta.f_number)),
         (t::FOCAL_LENGTH, r(meta.focal_length)),
         (t::ISO_SPEED, meta.iso.map(|i| Value::Short(vec![i.min(65_535) as u16]))),
@@ -559,6 +567,15 @@ mod write_tests {
         for iso in [65_534, 65_535, 102_400, 409_600] {
             let back = read_exif(&write_exif(&Metadata { iso: Some(iso), ..Default::default() }));
             assert_eq!(back.iso, Some(iso));
+        }
+    }
+
+    #[test]
+    fn fast_shutter_speeds_round_trip_exactly() {
+        for den in [8000.0, 12_800.0, 16_000.0, 32_000.0] {
+            let back = read_exif(&write_exif(&Metadata { exposure_time: Some(1.0 / den), ..Default::default() }));
+            let got = back.exposure_time.unwrap();
+            assert!((1.0 / got - den).abs() < 0.5, "1/{den} s came back as 1/{}", 1.0 / got);
         }
     }
 }

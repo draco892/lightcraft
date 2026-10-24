@@ -164,11 +164,13 @@ pub fn survey_step(app: &mut LightcraftApp, d: isize) -> Result<Value, String> {
 }
 
 /// After rating/flagging with Auto Advance: next candidate (Compare), next photo in the survey,
-/// else the next photo in the view.
-pub fn advance(app: &mut LightcraftApp) {
+/// else the next photo in the view. `was` is the active photo before the rating: a rating that took
+/// it out of the view made the photo after it active already, and that is the next one (#2312).
+pub fn advance(app: &mut LightcraftApp, was: Option<PhotoId>) {
     let _ = match app.ui.view {
         ViewMode::Compare => compare_step(app, 1),
         ViewMode::Survey => survey_step(app, 1),
+        _ if app.session.active() != was => Ok(Value::Null),
         _ => app.session.execute("library.next", &json!({})).map_err(|e| e.to_string()),
     };
 }
@@ -279,7 +281,7 @@ fn photo_tile(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, slot: Slo
         display = super::detail::fit_rect(img_area, texture_aspect, zoom, native, ppp, app.ui.pan);
         p.image(tex.tex.id(), display, uv, Color32::WHITE);
     } else {
-        p.rect_filled(img.intersect(img_area), 0.0, Color32::from_gray(38));
+        p.rect_filled(img.intersect(img_area), 0.0, Tokens::get(ui.ctx()).skeleton);
     }
     if photo.flag == Flag::Reject {
         p.rect_filled(display, 0.0, Color32::from_black_alpha(110));
@@ -343,7 +345,7 @@ fn photo_tile(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId, slot: Slo
         let filled = i < photo.rating;
         let r = Rect::from_min_size(pos2(x + i as f32 * 13.0, cap.center().y - 6.0), vec2(12.0, 12.0));
         if r.right() < cap.right() {
-            paint(pt, r, if filled { Icon::StarFilled } else { Icon::Star }, if filled { t.star } else { t.icon.gamma_multiply(0.6) });
+            crate::rating::paint_star(pt, r, filled, if filled { t.star } else { t.icon.gamma_multiply(0.6) });
         }
     }
     x += 5.0 * 13.0 + 4.0;

@@ -432,12 +432,79 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+thread_local! {
+    /// While [`AlbumPass`] is alive on this thread: the photos of each smart album that was counted whole, with
+    /// the longest chain of smart albums (itself included) its rules lead through.
+    static PASS: std::cell::RefCell<Option<std::collections::HashMap<crate::AlbumId, (usize, crate::tally::Members)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One pass over one catalog state that counts every smart album whole. Each album put in with `remember`
+/// answers [`smart_album_holds`] from its photos, not from its rules, until the pass is dropped (it can't outlive
+/// the state it was made of: it exists only inside the counting function).
+///
+/// Only an album whose rules lead to no loop may be remembered, and only with the height of its chain: its answer
+/// then doesn't depend on which albums are being evaluated around it, as long as the chain still fits under
+/// [`MAX_ALBUM_DEPTH`] from where it is asked (checked on every use; otherwise the rules are evaluated as before).
+pub(crate) struct AlbumPass {
+    outer: Option<std::collections::HashMap<crate::AlbumId, (usize, crate::tally::Members)>>,
+}
+
+impl AlbumPass {
+    pub(crate) fn begin() -> AlbumPass {
+        AlbumPass { outer: PASS.with_borrow_mut(|p| p.replace(std::collections::HashMap::new())) }
+    }
+
+    /// `id` holds exactly `members`, and its rules lead through a chain of `height` smart albums (itself included),
+    /// none of them in a loop.
+    pub(crate) fn remember(&self, id: crate::AlbumId, height: usize, members: crate::tally::Members) {
+        PASS.with_borrow_mut(|p| {
+            if let Some(p) = p {
+                p.insert(id, (height, members));
+            }
+        });
+    }
+
+    /// Ends the pass, giving back what was remembered.
+    pub(crate) fn finish(self) -> std::collections::HashMap<crate::AlbumId, crate::tally::Members> {
+        PASS.with_borrow_mut(Option::take).unwrap_or_default().into_iter().map(|(id, (_, members))| (id, members)).collect()
+    }
+}
+
+impl Drop for AlbumPass {
+    fn drop(&mut self) {
+        let outer = self.outer.take();
+        PASS.with_borrow_mut(|p| *p = outer);
+    }
+}
+
+/// What a counting pass knows of smart album `id` for `photo`, when asking now can't give another answer than
+/// evaluating its rules would: the chain below it fits under [`MAX_ALBUM_DEPTH`] from the albums being evaluated.
+fn pass_answer(id: crate::AlbumId, photo: crate::PhotoId) -> Option<bool> {
+    PASS.with_borrow(|p| {
+        let (height, members) = p.as_ref()?.get(&id)?;
+        let depth = EVALUATING.with_borrow(Vec::len);
+        (depth + height <= MAX_ALBUM_DEPTH).then(|| members.holds(photo))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a smart album's rules were worked out on this thread (tests count them).
+    pub(crate) static EVALUATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether `photo` is in smart album `id`, by `matches` (its rules), remembered for the rest of the
 /// outermost question and guarded by [`evaluating`] (a loop or a chain too deep holds nothing).
 pub(crate) fn smart_album_holds(id: crate::AlbumId, photo: crate::PhotoId, matches: impl FnOnce() -> bool) -> bool {
+    if let Some(known) = pass_answer(id, photo) {
+        return known;
+    }
     if let Some(known) = ANSWERS.with_borrow(|a| a.get(&(id, photo)).copied()) {
         return known;
     }
+    #[cfg(test)]
+    EVALUATED.with(|n| n.set(n.get() + 1));
     // the outermost question forgets the answers when it ends, however it ends
     struct Forget(bool);
     impl Drop for Forget {
@@ -456,7 +523,7 @@ pub(crate) fn smart_album_holds(id: crate::AlbumId, photo: crate::PhotoId, match
 }
 
 /// How deep smart albums may test smart albums before the innermost counts as holding nothing.
-const MAX_ALBUM_DEPTH: usize = 32;
+pub(crate) const MAX_ALBUM_DEPTH: usize = 32;
 
 /// Run `f` as the evaluation of smart album `id`'s rules: `None` (so it holds nothing) when `id`
 /// is already being evaluated (a loop the check would refuse, saved anyway) or the chain is

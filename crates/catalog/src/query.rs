@@ -240,6 +240,17 @@ fn has_person(p: &Photo, name: &str) -> bool {
 }
 
 impl Filter {
+    /// The labels that `label` and `labels` let through together (they AND), in `labels`' order;
+    /// `None` when neither is set, empty when they exclude each other. The chip and the filter
+    /// bar's buttons show this, so they match what is filtered.
+    pub fn labels_shown(&self) -> Option<Vec<ColorLabel>> {
+        match (self.label, self.labels.is_empty()) {
+            (None, true) => None,
+            (Some(l), true) => Some(vec![l]),
+            (l, false) => Some(self.labels.iter().copied().filter(|x| l.is_none_or(|l| l == *x)).collect()),
+        }
+    }
+
     /// Human-readable summary of the active rules (smart album tooltips, `album.list`).
     pub fn describe(&self) -> String {
         self.describe_in(None)

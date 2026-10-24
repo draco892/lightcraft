@@ -1068,6 +1068,54 @@ fn assisted_culling_groups_bursts_across_month_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Assisted culling: `burstGap` and `similarity` move the burst limits (#2275), and values out of
+/// range are refused before anything is measured or stored.
+#[test]
+fn assisted_culling_burst_limits_are_adjustable() {
+    let dir = temp_dir("cull-limits");
+    for (name, (w, h)) in [("a.png", (480, 320)), ("b.png", (482, 321))] {
+        let img = lightcraft_scenes::demo_library()[0].render(w, h);
+        let data: Vec<[u8; 4]> = img
+            .data
+            .iter()
+            .map(|c| {
+                let e = |v: f32| (lightcraft_color::transfer::linear_to_srgb(v.clamp(0.0, 1.0)) * 255.0).round() as u8;
+                [e(c[0]), e(c[1]), e(c[2]), 255]
+            })
+            .collect();
+        let png = lightcraft_codecs::encode_png(
+            &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 { width: img.width, height: img.height, data }),
+            &Default::default(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(name), png).unwrap();
+    }
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [dir.to_string_lossy()]})).unwrap();
+    let ids: Vec<u64> = r["imported"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
+    let by_name = |s: &Session, n: &str| s.catalog.photos().find(|p| p.file_name == n).unwrap().id;
+    let (a, b) = (by_name(&s, "a.png"), by_name(&s, "b.png"));
+    s.commit("t", lightcraft_catalog::Op::SetCaptured { id: a, captured: Some("2026-05-01T10:00:00".into()) }).unwrap();
+    s.commit("t", lightcraft_catalog::Op::SetCaptured { id: b, captured: Some("2026-05-01T10:00:15".into()) }).unwrap();
+    // 15 s apart: past the default 10 s, inside a 20 s gap
+    assert_eq!(s.execute("photo.analyze", &json!({"ids": ids})).unwrap()["groups"], 0);
+    assert_eq!(s.execute("photo.analyze", &json!({"ids": ids, "burstGap": 20})).unwrap()["groups"], 1);
+    // the look-alike pair is a burst at the default similarity, not when it must be identical
+    let strict = s.execute("photo.analyze", &json!({"ids": ids, "burstGap": 20, "similarity": 1.0})).unwrap();
+    assert_eq!(strict["groups"], 0, "{strict}");
+    // bad values change nothing
+    let undo_before = s.commits();
+    for bad in
+        [json!({"burstGap": -1}), json!({"burstGap": 86401}), json!({"burstGap": "10"}), json!({"similarity": 1.5}), json!({"similarity": -0.1})]
+    {
+        let mut p = bad.clone();
+        p["ids"] = json!(ids);
+        assert!(s.execute("photo.analyze", &p).is_err(), "{bad} must be refused");
+    }
+    assert_eq!(s.commits(), undo_before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Find Dust Spots: soft dark spots on a smooth sky are found and healed (one undo step).
 #[test]
 fn dust_spots_are_found_and_healed() {

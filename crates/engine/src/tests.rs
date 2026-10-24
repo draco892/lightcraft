@@ -109,6 +109,20 @@ fn demo_library_loads() {
 }
 
 #[test]
+fn rating_rejects_fractional_values() {
+    let mut s = demo();
+    let id = s.active().unwrap();
+    for bad in [5.9, -0.9, 0.5] {
+        let err = s.execute("photo.rate", &json!({"rating": bad})).unwrap_err();
+        assert!(matches!(&err, crate::EngineError::BadParams { cmd, .. } if cmd == "photo.rate"), "{bad}: {err}");
+        assert_eq!(s.catalog.photo(id).unwrap().rating, 0, "{bad} changed the rating");
+    }
+    s.execute("photo.rate", &json!({"rating": 5.0})).unwrap();
+    s.execute("photo.rate", &json!({"rating": 3})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().rating, 3);
+}
+
+#[test]
 fn rating_flag_undo_redo() {
     let mut s = demo();
     let id = s.active().unwrap();

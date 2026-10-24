@@ -642,7 +642,7 @@ fn info(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
             ui.label(egui::RichText::new(crate::i18n::tr_format!("Virtual copy “{name}” of {of}", name = name, of = of)).color(t.text_label));
         }
         ui.add_space(8.0);
-        if let Some(r) = ui.horizontal(|ui| crate::widgets::stars(ui, "info", p.rating, 20.0)).inner {
+        if let Some(r) = ui.horizontal(|ui| crate::rating::Rating::new("info", p.rating).show(ui)).inner {
             let mut params = json!({"rating": r});
             crate::panels::compare::target_active(app, &mut params);
             let _ = app.run("photo.rate", params);
@@ -866,7 +866,7 @@ fn camera_card(ui: &mut egui::Ui, p: &lightcraft_catalog::Photo) {
                 }
             });
         }
-        // where the camera focused, and how (View ▸ Show Focus Point draws it): only when known; the
+        // where the camera focused, and how (View ▸ Focus Point draws it): only when known; the
         // whole card's width, so "AF-C · Expanded Flexible Spot · Face tracking" fits
         if let Some(text) = focus_text(m.focus.as_ref()) {
             ui.add_space(3.0);

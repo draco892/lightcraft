@@ -169,7 +169,10 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         };
         if let Some(status) = status {
             ui.add_space(4.0);
-            ui.add(egui::Label::new(egui::RichText::new(crate::i18n::tr(status)).color(t.text_dim)).wrap());
+            ui.horizontal_top(|ui| {
+                crate::progress::spinner(ui, 14.0);
+                ui.add(egui::Label::new(egui::RichText::new(crate::i18n::tr(status)).color(t.text_dim)).wrap());
+            });
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
         }
         // the model download, while its dialog is closed
@@ -177,11 +180,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         if download.running && app.ui.dialog.is_none() {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let pct = if download.total > 0 { download.done as f64 / download.total as f64 } else { 0.0 };
-                let r = ui.add(
-                    egui::ProgressBar::new(pct as f32).desired_width(ui.available_width() - 70.0).text(format!("SAM 3: {} %", (pct * 100.0).floor())),
-                );
-                register(ui.ctx(), "maskSamProgress", r.rect);
+                // the bar takes what the Details button leaves
+                let details = ui.spacing().interact_size.x + 30.0;
+                sam_download_bar(ui, download.done, download.total, (ui.available_width() - details).max(96.0));
                 if text_button(ui, "maskSamDetails", crate::i18n::tr("Details"), false).clicked() {
                     app.offer_sam_download(None);
                 }
@@ -760,6 +761,28 @@ pub(crate) fn start_describe(app: &mut LightcraftApp, op: &str) {
     app.ui.describe = Some((op.to_string(), String::new()));
 }
 
+/// The SAM model's download, `width` wide. The label is a percentage once the size is known and
+/// just the model's name before, so the bar keeps its height and its accessible name.
+pub(crate) fn sam_download_bar(ui: &mut egui::Ui, done: u64, total: u64, width: f32) -> egui::Response {
+    let fraction = crate::progress::fraction_of(done, total);
+    let label = match fraction {
+        Some(f) => format!("SAM 3: {} %", crate::progress::percent(f)),
+        None => "SAM 3".to_string(),
+    };
+    crate::progress::Progress::new(fraction).label(label).width(width).widget("maskSamProgress").show(ui)
+}
+
+/// Whether the segmenter has work (loading, analyzing, a request, a detail pass running or waiting
+/// to start): nothing new starts then.
+fn segmenter_working(analyzing: bool, busy: bool, detail_busy: bool, detail_due: bool) -> bool {
+    analyzing || busy || detail_busy || detail_due
+}
+
+/// Enter in the Describe field is the Select button: it starts nothing while the segmenter works.
+fn enter_submits(working: bool, lost_focus: bool, enter_pressed: bool) -> bool {
+    !working && lost_focus && enter_pressed
+}
+
 /// The Describe field: type what to select ("sky", "the red car") and press Return.
 fn describe_field(app: &mut LightcraftApp, ui: &mut egui::Ui, new_mask: bool) {
     let Some((op, mut text)) = app.ui.describe.clone() else { return };
@@ -777,7 +800,9 @@ fn describe_field(app: &mut LightcraftApp, ui: &mut egui::Ui, new_mask: bool) {
     let mut submit = false;
     // the (translated) Select button is placed first, at the right; the field takes what is left
     ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if text_button(ui, "maskDescribeGo", crate::i18n::tr("Select"), false).clicked() {
+        let seg = &app.session.segmenter;
+        let working = segmenter_working(seg.analyzing(), seg.busy(), seg.detail_busy(), app.ui.detail_due.is_some());
+        if crate::button::Button::new("Select").small().busy(working).widget("button:maskDescribeGo").show(ui).clicked() {
             submit = true;
         }
         let r = ui.add(
@@ -789,7 +814,8 @@ fn describe_field(app: &mut LightcraftApp, ui: &mut egui::Ui, new_mask: bool) {
         if !r.has_focus() && !r.lost_focus() && text.is_empty() {
             r.request_focus();
         }
-        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        // Enter is the Select button: nothing starts while the segmenter is working
+        if enter_submits(working, r.lost_focus(), ui.input(|i| i.key_pressed(egui::Key::Enter))) {
             submit = true;
         }
     });
@@ -896,6 +922,28 @@ fn brush_settings(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_detail_pass_counts_as_the_segmenter_working() {
+        assert!(segmenter_working(false, false, true, false));
+        assert!(segmenter_working(true, false, false, false));
+        assert!(segmenter_working(false, true, false, false));
+        assert!(!segmenter_working(false, false, false, false));
+    }
+
+    #[test]
+    fn a_pending_detail_pass_counts_as_the_segmenter_working() {
+        // a new prompt finishing before it starts would replace its target, and that mask never refines
+        assert!(segmenter_working(false, false, false, true));
+    }
+
+    #[test]
+    fn enter_in_the_describe_field_starts_nothing_while_the_segmenter_works() {
+        assert!(enter_submits(false, true, true));
+        assert!(!enter_submits(true, true, true));
+        assert!(!enter_submits(false, false, true));
+        assert!(!enter_submits(false, true, false));
+    }
 
     /// The grid keeps four 52 pt tiles when the labels fit, and gives a long (translated) label
     /// room by dropping a column rather than drawing it past its tile.

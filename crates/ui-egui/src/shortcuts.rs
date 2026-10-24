@@ -68,8 +68,10 @@ pub fn shortcut_of<'a>(keymap: &'a Keymap, id: &str) -> Option<&'a str> {
     find_bindable(id).and_then(|b| binding(keymap, id, b.default))
 }
 
-/// Engine commands that intentionally share a key and are disambiguated by context in [`handle`].
-pub const CONTEXTUAL: &[(&str, &str)] = &[("photo.reject", "crop.rotateAspect")];
+/// Engine commands that intentionally share a key and are disambiguated by context in [`handle`]:
+/// the X pair by the Crop panel, A by whether it is open (Visualize Spots everywhere, the aspect
+/// lock under the Crop panel).
+pub const CONTEXTUAL: &[(&str, &str)] = &[("photo.reject", "crop.rotateAspect"), ("view.visualizeSpots", "crop.lockAspect")];
 
 /// Commands other than `id` whose shortcut is the key `sc` (contextual partners excepted).
 pub fn conflicts(keymap: &Keymap, id: &str, sc: &str) -> Vec<&'static str> {
@@ -443,9 +445,10 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
     // Auto Advance then moves on (next candidate in Compare, next photo elsewhere)
     let cull = |app: &mut LightcraftApp, id: &str, mut params: serde_json::Value, advance: bool| {
         compare::target_active(app, &mut params);
+        let was = app.session.active();
         let ok = app.run(id, params).is_ok();
         if ok && (advance || app.ui.auto_advance) {
-            compare::advance(app);
+            compare::advance(app, was);
         }
     };
     for (id, params) in aliased {
@@ -621,6 +624,13 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
             if f == "crop.rotateAspect" && app.ui.right != crate::state::RightPanel::Crop {
                 continue;
             }
+            // A is both Visualize Spots and the crop aspect lock: each key only in its own context
+            if f == "view.visualizeSpots" && app.ui.right == crate::state::RightPanel::Crop {
+                continue;
+            }
+            if f == "crop.lockAspect" && app.ui.right != crate::state::RightPanel::Crop {
+                continue;
+            }
             // / refreshes the selected spot's source in the Remove tool (the filmstrip elsewhere)
             if f == "view.filmstrip" && app.ui.right == crate::state::RightPanel::Remove && app.session.active_spot.is_some() {
                 let _ = app.run("spot.refreshSource", json!({}));
@@ -631,12 +641,11 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
                 let _ = app.run("view.maskOverlayColor", json!({}));
                 continue;
             }
-            // while cropping: O cycles the guides, Shift+O their orientation, A locks the aspect
+            // while cropping: O cycles the guides, Shift+O their orientation
             if app.ui.right == crate::state::RightPanel::Crop {
                 let crop_key = match f.as_str() {
                     "view.maskOverlay" => Some(("view.cropOverlay", json!({}))),
                     "view.cropOverlay" => Some(("view.cropOverlayOrientation", json!({}))),
-                    "view.visualizeSpots" => Some(("crop.aspect", json!({"aspect": "toggle"}))),
                     _ => None,
                 };
                 if let Some((cmd, p)) = crop_key {
@@ -925,6 +934,38 @@ mod tests {
     }
 
     #[test]
+    fn culling_keys_go_on_from_a_photo_that_leaves_the_filter() {
+        // #2312: the filter shows one-star photos; taking photo 2's star off makes photo 3 active, once, with or
+        // without Shift and Auto Advance, and → goes on from there instead of from the first photo
+        use lightcraft_catalog::PhotoId;
+        let one_star = || {
+            let mut h = library();
+            h.app.session.execute("library.selectAll", &json!({})).unwrap();
+            h.app.session.execute("photo.rate", &json!({"rating": 1})).unwrap();
+            h.app.session.execute("library.filter", &json!({"rating": 1, "ratingOp": "exactly"})).unwrap();
+            h.app.session.execute("library.select", &json!({"ids": [2]})).unwrap();
+            h
+        };
+        for view in [crate::state::ViewMode::PhotoGrid, crate::state::ViewMode::Detail] {
+            for (shift, auto) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut h = one_star();
+                h.app.ui.view = view;
+                h.app.ui.auto_advance = auto;
+                key(&mut h, "0", shift);
+                assert_eq!(h.app.session.catalog.photo(PhotoId(2)).unwrap().rating, 0);
+                assert_eq!(h.app.session.active(), Some(PhotoId(3)), "{view:?} Shift={shift} Auto Advance={auto}");
+                key(&mut h, "right", false);
+                assert_eq!(h.app.session.active(), Some(PhotoId(4)), "{view:?} Shift={shift} Auto Advance={auto}");
+            }
+        }
+        // the Photo menu with Auto Advance too
+        let mut h = one_star();
+        h.app.ui.auto_advance = true;
+        crate::menubar::run_item(&mut h.app, "photo.rate", json!({"rating": 0})).unwrap();
+        assert_eq!(h.app.session.active(), Some(PhotoId(3)));
+    }
+
+    #[test]
     fn color_label_actions_show_feedback_only_after_success() {
         use lightcraft_catalog::PhotoId;
         let mut h = library();
@@ -1128,7 +1169,8 @@ mod tests {
         }
         for (i, (k, a)) in ui.iter().enumerate() {
             for (k2, b) in &ui[i + 1..] {
-                assert!(k != k2, "{a} and {b} share a key");
+                let contextual = CONTEXTUAL.iter().any(|(x, y)| (x == a && y == b) || (x == b && y == a));
+                assert!(k != k2 || contextual, "{a} and {b} share a key");
             }
         }
         for (i, (k, a)) in engine.iter().enumerate() {

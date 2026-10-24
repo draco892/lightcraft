@@ -515,7 +515,7 @@ fn rows_added_later_grow_the_stack() {
 fn immediate_library_commands_and_auto_sync_show_completion() {
     let mut h = demo();
     assert!(h.app.run("library.clearPreviews", json!({})).is_ok());
-    assert_eq!(h.app.ui.toast.as_ref().map(|t| t.0.as_str()), Some("✓ Clear Preview Cache"));
+    assert_eq!(h.app.ui.toast.as_ref().map(|t| t.0.as_str()), Some("✓ Discard Preview Cache"));
 
     assert_eq!(h.app.run("develop.autoSync", json!({"on": true})).unwrap()["on"], true);
     assert_eq!(h.app.ui.toast.as_ref().map(|t| t.0.as_str()), Some("Auto Sync: On"));

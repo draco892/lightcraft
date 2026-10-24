@@ -247,6 +247,9 @@ mod tests {
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let (stream, _) = listener.accept().unwrap();
+            // Small test messages must not wait for Nagle's algorithm or a delayed ACK.
+            client.set_nodelay(true).unwrap();
+            stream.set_nodelay(true).unwrap();
             before(&mut client);
             let (tx, requests) = channel();
             let worker = spawn_connection(stream, tx, egui::Context::default(), Arc::clone(open), idle).unwrap();
@@ -316,6 +319,10 @@ mod tests {
             // A dispatched command waits for its reply, not for socket input.
             std::thread::sleep(Duration::from_millis(250));
             req.reply.send(json!({"ok": true, "result": id})).unwrap();
+            if id == 2 {
+                // The worker must reach EOF even before the client reads its final reply.
+                connection.join();
+            }
             let mut reply = String::new();
             connection.client.read_line(&mut reply).unwrap();
             let reply: Value = serde_json::from_str(&reply).unwrap();

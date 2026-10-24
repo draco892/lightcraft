@@ -23,7 +23,11 @@ use crate::store::{Originals, content_hash, download_name, storage_key};
 use crate::wire::ThumbIndex;
 use crate::workers::{THUMB_INDEX, Workers};
 
-const ACCEPT: &str = ".jpg,.jpeg,.png,.tif,.tiff,.webp,.dng,.cr2,.nef,.arw,.psd,.jxl,.gif,.bmp";
+/// The web picker's accept list, derived from the engine's import extensions (both
+/// cases) so no format the engine can import is silently filtered out of the dialog.
+fn accept_list() -> String {
+    lightcraft_engine::import::accept_list()
+}
 
 /// After a failed save, wait this long before trying again (ms).
 const SAVE_RETRY_MS: f64 = 2000.0;
@@ -123,7 +127,7 @@ fn open_picker(originals: Originals, backend: Option<Backend>, ctx: egui::Contex
     let Ok(input) = doc.create_element("input").map(|e| e.unchecked_into::<web_sys::HtmlInputElement>()) else { return };
     input.set_type("file");
     input.set_multiple(true);
-    input.set_accept(ACCEPT);
+    input.set_accept(&accept_list());
     let inp = input.clone();
     let on_change = Closure::<dyn FnMut()>::new(move || {
         if let Some(files) = inp.files() {
@@ -273,6 +277,8 @@ async fn flush(files: Files, backend: Backend, dir: String, flushing: Rc<Cell<bo
         }
     }
     flushing.set(false);
+    // the page title drops its unsaved • now, even when nothing else wakes the page
+    request_repaint();
 }
 
 /// Everything loaded before the UI starts.
@@ -402,6 +408,8 @@ struct WebApp {
     lib_dir: String,
     bench: Option<Bench>,
     first_frame_logged: bool,
+    /// The page title last set (`document.title`), so it is written only when it changes.
+    title: String,
     last_save: f64,
     ui_written: Vec<u8>,
 }
@@ -501,6 +509,7 @@ impl WebApp {
             lib_dir,
             bench: opts.bench.then(|| Bench::new(origin)),
             first_frame_logged: false,
+            title: String::new(),
             last_save: 0.0,
             ui_written,
         }
@@ -508,22 +517,37 @@ impl WebApp {
 
     fn import_dropped(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        // a dialog is on screen (the card said so while the files hovered): nothing is read or imported
+        // (files read from an earlier drop still finish below)
+        if !dropped.is_empty() && self.app.ui.dialog.is_some() {
+            self.app.toast(ctx, lightcraft_ui_egui::i18n::tr("Close the open dialog, then drop the files again"));
+            return;
+        }
         for f in dropped {
             let (originals, backend, ctx) = (self.originals.clone(), self.backend.clone(), ctx.clone());
             wasm_bindgen_futures::spawn_local(async move {
                 let name = f.path().to_string_lossy().to_string();
                 match f.bytes_async().await {
                     Ok(bytes) => store_file(originals, backend, name, bytes, ctx).await,
-                    Err(e) => log::warn!("reading dropped {name}: {e}"),
+                    Err(e) => notice(lightcraft_ui_egui::i18n::dropped_file_unreadable(&name, &e.to_string())),
                 }
             });
         }
         let paths = self.originals.take_pending();
         if !paths.is_empty() {
-            let n = paths.len();
             match self.app.run("library.import", json!({"paths": paths})) {
-                Ok(_) => self.app.toast(ctx, format!("Added {n} photo{}", if n == 1 { "" } else { "s" })),
-                Err(e) => log::warn!("import: {e}"),
+                // what the import did, not what was submitted: duplicates and unsupported files add nothing,
+                // a drop that only finds duplicates says nothing (as the desktop import's toast does when it
+                // shows where they are), and one whose files could not be read says so
+                Ok(report) => {
+                    if let Some(notice) = lightcraft_ui_egui::i18n::dropped_photos_outcome(&report) {
+                        self.app.toast(ctx, notice);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("import: {e}");
+                    self.app.toast(ctx, lightcraft_ui_egui::i18n::dropped_import_failed(&e));
+                }
             }
         }
     }
@@ -639,8 +663,11 @@ impl WebApp {
     fn run_inbox(&mut self) {
         let inbox = INBOX.with(|q| std::mem::take(&mut *q.borrow_mut()));
         for (id, params, (resolve, reject)) in inbox {
-            let params: serde_json::Value = serde_json::from_str(&params).unwrap_or(json!({}));
-            let r = if id == "web.stats" { Ok(self.web_stats()) } else { self.app.run(&id, params) };
+            let r = match crate::automation::params(&params) {
+                Err(e) => Err(format!("{id}: {e}")),
+                Ok(_) if id == "web.stats" => Ok(self.web_stats()),
+                Ok(params) => self.app.run(&id, params),
+            };
             let _ = match r {
                 Ok(v) => resolve.call1(&JsValue::NULL, &v.to_string().into()),
                 Err(e) => reject.call1(&JsValue::NULL, &e.into()),
@@ -686,6 +713,14 @@ impl eframe::App for WebApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        // eframe's web runner ignores `ViewportCommand::Title`: name the open photo in the page title
+        let title = self.app.page_title(self.files.is_dirty() || self.flushing.get());
+        if title != self.title
+            && let Some(doc) = window().and_then(|w| w.document())
+        {
+            doc.set_title(&title);
+            self.title = title;
+        }
         if !self.first_frame_logged && !self.app.widgets.is_empty() {
             self.first_frame_logged = true;
             log::info!("lightcraft first UI frame at {:.0} ms after navigation start", perf_now());

@@ -298,10 +298,10 @@ lightcraft --control 7980 ~/Pictures/trip
 
 ## Feature status
 
-LightCraft 很年轻，而且进展很快。**我们如实所处的位置**（细节见[路线图](ROADMAP.md#where-we-stand)）：
+LightCraft 很年轻，而且进展很快。**我们如实所处的位置**（细节见[路线图](ROADMAP.md)）：
 
 - **按功能数量算，我们达到了约 79%**（核心功能 98%），逐行记录在
-  [docs/parity.md](docs/parity.md)。
+  [docs/parity-checklist.md](docs/parity-checklist.md)。
 - **作为日常使用的工具，我们更接近 60–70%。** 在单台机器上处理 JPEG/DNG 以及大多数尼康／索尼／
   较老佳能的 raw 都很出色。
 - **最大的缺口：**
@@ -309,7 +309,7 @@ LightCraft 很年轻，而且进展很快。**我们如实所处的位置**（�
   - **压缩的奥林巴斯 raw 和不受支持的 CR3 变体：** 这些在有内嵌 JPEG 预览时使用预览。富士无损／有损压缩 RAF 现在能解码传感器数据；[验证与已有图库重新加载说明](docs/raf-compression.md)；
   - **AI 蒙版与降噪：** 主体和天空选择目前是经典启发式算法；
   - **屏幕上的 HDR 显示、视频，以及经典版式中的打印／画册／地图模块。**
-- **接下来做什么：** 见[我们要去往哪里](ROADMAP.md#where-were-going)。
+- **接下来做什么：** 见[我们要去往哪里](ROADMAP.md#upcoming)。
 
 | 领域 | 状态 |
 |---|---|
@@ -333,7 +333,7 @@ LightCraft 很年轻，而且进展很快。**我们如实所处的位置**（�
 | 镜头校正（畸变、暗角、自动 + 手动色差、去边、DNG 文件内嵌的镜头校正以及松下／徕卡 RW2／RWL 畸变数据）、几何（变换、限制裁剪）、垂直校正（自动／水平／垂直／完整／引导式） | ✅ · 相机镜头配置文件（我们自己的）⬜ |
 | 照片合并：HDR（自动对齐、去重影）、全景（球面／圆柱／透视、边界变形、自动裁剪）、HDR 全景 → DNG | ✅ |
 | GPU 管线（wgpu 计算，与 CPU 一致到 1/255 以内）、设备限制／出错时回退到 CPU | ✅ · 浏览器中的 WebGPU 🚧 |
-| AI：分割蒙版、AI 降噪、超分辨率、人脸；视频 | ⬜（见[路线图](ROADMAP.md#where-were-going)） |
+| AI：分割蒙版、AI 降噪、超分辨率、人脸；视频 | ⬜（见[路线图](ROADMAP.md#upcoming)） |
 | 网页版（通过 WASM 在浏览器中使用同一界面）：图库持久化在 OPFS/IndexedDB、Web Worker 渲染、导出下载 | ✅ · WebGPU、Safari/Firefox 测试 🚧 |
 
 <sub>✅ 现已可用 · 🚧 进行中 · ⬜ 尚未开始</sub>

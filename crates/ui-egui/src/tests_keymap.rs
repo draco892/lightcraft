@@ -453,3 +453,51 @@ fn cmd_o_does_not_fire_while_a_dialog_is_open() {
     press(&mut h, "O", &["cmd"]);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+/// The crop aspect lock is a first-class row of Help - Keyboard Shortcuts: A, listed in the
+/// editor like any other command, sharing the key with Visualize Spots as a contextual pair.
+#[test]
+fn lock_aspect_ratio_is_a_listed_row_on_a() {
+    use crate::shortcuts::{CONTEXTUAL, Keymap, bindable, shortcut_of};
+    let b = bindable().iter().find(|b| b.id == "crop.lockAspect").expect("crop.lockAspect is mappable");
+    assert_eq!(b.label, "Lock Aspect Ratio");
+    assert_eq!(b.default, Some("A"));
+    assert_eq!(shortcut_of(&Keymap::new(), "crop.lockAspect"), Some("A"));
+    assert!(CONTEXTUAL.contains(&("view.visualizeSpots", "crop.lockAspect")), "A is disambiguated by context");
+    // the editor lists it: the row is on screen and records keys for it
+    let mut h = demo();
+    record(&mut h, "lock", "crop.lockAspect");
+    key(&mut h, "Escape", false);
+    assert_eq!(shortcut_of(&h.app.ui.settings.keymap, "crop.lockAspect"), Some("A"), "Esc cancels the recording: A stays");
+    key(&mut h, "Escape", false);
+    assert!(h.app.ui.dialog.is_none());
+}
+
+/// A is the aspect lock while the Crop panel is open — Visualize Spots, the other A, must not take
+/// the panel or turn its view on — and outside the panel A opens Visualize Spots as usual. The lock
+/// is the tool's own (a fresh photo starts locked to its shape and the toggle may only record
+/// "free", leaving the raw develop aspect untouched), so the test reads `crop_tool_aspect`.
+#[test]
+fn a_is_the_aspect_lock_under_crop_and_visualize_spots_elsewhere() {
+    use crate::state::RightPanel;
+    let mut h = demo();
+    let aspect = |h: &Headless| h.app.crop_tool_aspect();
+    let spots_before = h.app.ui.visualize_spots;
+    h.app.run("panel.crop", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.app.ui.right, RightPanel::Crop);
+    let before = aspect(&h);
+    key(&mut h, "A", false);
+    assert_eq!(h.app.ui.right, RightPanel::Crop, "Visualize Spots must not take the panel");
+    assert_eq!(h.app.ui.visualize_spots, spots_before, "nor turn its view on");
+    assert_ne!(aspect(&h), before, "A toggles the aspect lock");
+    key(&mut h, "A", false);
+    assert_eq!(aspect(&h), before, "A toggles it back");
+    // outside the panel the same key is Visualize Spots again
+    h.app.ui.right = RightPanel::None;
+    key(&mut h, "A", false);
+    assert_eq!(h.app.ui.right, RightPanel::Remove, "A opens Remove with the visualization");
+    assert!(h.app.ui.visualize_spots, "Visualize Spots is on");
+    assert_eq!(aspect(&h), before, "and the aspect is untouched");
+}

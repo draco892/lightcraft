@@ -195,6 +195,31 @@ pub struct Interaction {
 /// The most photos an edit may touch for the view to follow it photo by photo; a larger edit is worked out whole.
 const MAX_FOLLOWED: usize = 256;
 
+/// The established clock precision for relative-date views and sidebar counts.
+fn clock_minute(now: &str) -> &str {
+    now.get(..16).unwrap_or(now)
+}
+
+/// Whether a query can change membership without a catalog edit, including the smart albums it tests.
+fn filter_depends_on_clock(filter: &Filter, catalog: &Catalog) -> bool {
+    if filter.depends_on_now() {
+        return true;
+    }
+    let mut pending = filter.albums_tested();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(smart) = catalog.album(id).and_then(|album| album.smart.as_deref()) else { continue };
+        if smart.depends_on_now() {
+            return true;
+        }
+        pending.extend(smart.albums_tested());
+    }
+    false
+}
+
 /// Source of [`Session::visible_shared`] generations (process-wide, so two sessions never share one).
 static VISIBLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -215,6 +240,8 @@ pub struct Session {
     /// Shared, so frontends can hold it across frames without copying ([`Session::visible_shared`]).
     visible: Arc<[PhotoId]>,
     visible_key: Option<(u64, String)>,
+    /// The minute used for a cached view whose rules depend on the session clock.
+    visible_clock_minute: Option<String>,
     /// A view holds the photos it shows until it is refreshed (`library.holdView`): an edit that makes a photo stop
     /// matching a smart album's rules, Picks or the filter bar leaves it where it is. Off: the photo goes at once.
     pub hold_view: bool,
@@ -234,7 +261,7 @@ pub struct Session {
     /// is recomputed, so frontends can key their per-view caches on it instead of hashing the ids.
     visible_gen: u64,
     /// Photos in the current source with no filter on (cached like `visible`).
-    total: Option<((u64, String), usize)>,
+    total: Option<((u64, String), usize, Option<String>)>,
     pub undo: Vec<UndoEntry>,
     /// Undo steps committed in this session, ever (the history drops its oldest past 1000, so
     /// its length can't tell how many steps a command just made; see [`Session::commits`]).
@@ -429,6 +456,7 @@ impl Session {
             selection: Selection::default(),
             visible: Vec::new().into(),
             visible_key: None,
+            visible_clock_minute: None,
             hold_view: false,
             base: None,
             view_followed: 0,
@@ -1050,12 +1078,20 @@ impl Session {
         };
         let view = format!("{}|{rules}", key.1);
         if self.source == LibrarySource::Missing && self.media.availability.is_background() {
-            // the view fills in as the background checks find files gone
-            key.1.push_str(&format!("|{}", self.media.availability.generation()));
+            // the view fills in as the background checks find files gone (a file found there at
+            // its first check changes nothing it shows)
+            key.1.push_str(&format!("|{}", self.media.availability.gone_generation()));
         }
-        if self.visible_key.as_ref() != Some(&key) {
-            // "in the last N days" rules count back from the session's clock
-            lightcraft_catalog::rules::set_now(Some((self.clock)()));
+        let key_changed = self.visible_key.as_ref() != Some(&key);
+        // A time-dependent cache needs one clock read to test its minute stamp. A new view also
+        // needs one value for the query, even when its previous cached view did not use the clock.
+        let current_now = (key_changed || self.visible_clock_minute.is_some()).then(|| (self.clock)());
+        let current_minute = current_now.as_deref().map(clock_minute);
+        let clock_changed = self.visible_clock_minute.as_deref().is_some_and(|cached| current_minute != Some(cached));
+        if key_changed || clock_changed {
+            // Use this same value to evaluate relative rules and stamp the result.
+            let now = current_now.unwrap_or_else(|| (self.clock)());
+            lightcraft_catalog::rules::set_now(Some(now.clone()));
             let f = self.view_filter(self.source, &self.filter);
             // A held view keeps the photos it shows that stopped matching what is asked of them (a smart album's
             // rules, a flag, the filter bar), as long as they are still where the view looks: in the library for
@@ -1082,8 +1118,7 @@ impl Session {
             let whole = own_order || matches!(self.source, LibrarySource::RecentlyAdded | LibrarySource::Missing);
             // A view that asks about "the last N days" (itself, or through a smart album it looks into) changes
             // with the clock as well as with edits: a photo nobody touched can stop matching. It is asked whole.
-            let clocked = f.depends_on_now()
-                || (!f.albums_tested().is_empty() && self.catalog.albums().any(|al| al.smart.as_deref().is_some_and(Filter::depends_on_now)));
+            let clocked = filter_depends_on_clock(&f, &self.catalog);
             let base = self.base.take().filter(|(of, _, _)| *of == view);
             // A small edit to the same view: the photos it touched are taken out, asked about again, and put back
             // at their place in the order. The others neither stopped matching nor moved.
@@ -1157,6 +1192,7 @@ impl Session {
             self.visible = visible.into();
             self.visible_gen = VISIBLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.visible_key = Some(key);
+            self.visible_clock_minute = clocked.then(|| clock_minute(&now).to_owned());
         }
         &self.visible
     }
@@ -1189,12 +1225,20 @@ impl Session {
     /// view, so a list followed many times over is compared, not only one followed once.
     #[cfg(test)]
     pub(crate) fn visible_in_full(&mut self) -> Vec<PhotoId> {
-        let kept = (self.base.clone(), self.visible_key.clone(), self.visible.clone(), self.visible_gen, self.view_followed, self.view_worked_out);
+        let kept = (
+            self.base.clone(),
+            self.visible_key.clone(),
+            self.visible_clock_minute.clone(),
+            self.visible.clone(),
+            self.visible_gen,
+            self.view_followed,
+            self.view_worked_out,
+        );
         self.never_follow = true;
         self.visible_key = None;
         let whole = self.visible().to_vec();
         self.never_follow = false;
-        (self.base, self.visible_key, self.visible, self.visible_gen, self.view_followed, self.view_worked_out) = kept;
+        (self.base, self.visible_key, self.visible_clock_minute, self.visible, self.visible_gen, self.view_followed, self.view_worked_out) = kept;
         whole
     }
 
@@ -1222,7 +1266,15 @@ impl Session {
             }
         }
         let key = (self.catalog.revision, format!("{:?}|{:?}|{:?}", self.source, self.browse, self.library_folder));
-        if self.total.as_ref().map(|t| &t.0) != Some(&key) {
+        let key_changed = self.total.as_ref().map(|total| &total.0) != Some(&key);
+        let cached_minute = self.total.as_ref().and_then(|total| total.2.as_deref());
+        let current_now = cached_minute.map(|_| (self.clock)());
+        let current_minute = current_now.as_deref().map(clock_minute);
+        let clock_changed = cached_minute.is_some_and(|cached| current_minute != Some(cached));
+        if key_changed || clock_changed {
+            // The source count can be requested before `visible`; bind it to the session's clock itself.
+            let now = current_now.unwrap_or_else(|| (self.clock)());
+            lightcraft_catalog::rules::set_now(Some(now.clone()));
             let mut f = self.source.to_filter(&Filter::default(), &self.catalog);
             if self.source == LibrarySource::Folder {
                 let b = self.browse.clone().unwrap_or_default();
@@ -1234,7 +1286,8 @@ impl Session {
             }
             // (how many, not which: nothing to put in order)
             let n = self.catalog.count(&f);
-            self.total = Some((key, n));
+            let clocked = filter_depends_on_clock(&f, &self.catalog);
+            self.total = Some((key, n, clocked.then(|| clock_minute(&now).to_owned())));
         }
         self.total.as_ref().map(|t| t.1)
     }

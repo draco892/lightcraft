@@ -26,7 +26,13 @@ fn get_set_and_reset() {
     assert_eq!(g["pageWidth"], 8.5);
     assert_eq!(g["printable"]["x"], 0.25);
     assert_eq!(g["settings"]["job"]["ppi"], 240.0);
-    assert!(g["papers"].as_array().unwrap().iter().any(|p| p["name"] == "a4"));
+    let papers = g["papers"].as_array().unwrap();
+    assert!(papers.iter().any(|p| p["name"] == "a4"));
+    // The Japanese photo and postcard papers are listed with their metric sizes in inches.
+    let paper = |name: &str| papers.iter().find(|p| p["name"] == name).cloned().unwrap_or_else(|| panic!("{name}"));
+    let l = paper("l");
+    assert!((l["width"].as_f64().unwrap() - 89.0 / 25.4).abs() < 1e-9 && (l["height"].as_f64().unwrap() - 127.0 / 25.4).abs() < 1e-9);
+    assert!(papers.iter().any(|p| p["name"] == "postcard") && papers.iter().any(|p| p["name"] == "6cut"));
     assert_eq!(g["gridCells"].as_array().unwrap().len(), 1);
 
     let g = run(
@@ -211,6 +217,28 @@ fn export_pdf_prints_the_current_settings() {
     // a package with no cells has nothing to print
     run(&mut s, "print.set", json!({"layout": {"style": "picturePackage"}}));
     fails(&mut s, "print.exportPdf", json!({"path": path, "ids": ids}));
+}
+
+/// The Japanese photo and postcard papers reach the PDF page at their metric sizes: はがき is
+/// 100 × 148 mm (283.46 × 419.53 pt) and L is 89 × 127 mm (252.28 × 359.99 pt). 254 ppi is exactly
+/// ten pixels per millimetre, so the page pixels are whole millimetres and the MediaBox is exact.
+#[test]
+fn export_pdf_uses_the_japanese_paper_sizes() {
+    let mut s = Session::with_demo();
+    let id = s.catalog.photos().next().map(|p| p.id.0).unwrap();
+    for (paper, w_pt, h_pt) in [("postcard", 283.46, 419.53), ("はがき", 283.46, 419.53), ("l", 252.28, 359.99)] {
+        run(&mut s, "print.set", json!({"layout": {"style": "singleImage", "page": {"paper": paper}}, "job": {"ppi": 254.0}}));
+        let path = temp_pdf(paper);
+        run(&mut s, "print.exportPdf", json!({"path": path, "ids": [id]}));
+        let bytes = std::fs::read(&path).unwrap();
+        let (w, h) = media_box(&bytes);
+        assert!((w - w_pt).abs() < 0.1 && (h - h_pt).abs() < 0.1, "{paper}: {w} x {h} pt, wanted {w_pt} x {h_pt}");
+    }
+    // The customary names are accepted and the page size follows them; an unknown name is refused.
+    let g = run(&mut s, "print.set", json!({"layout": {"page": {"paper": "はがき"}}}));
+    assert!((g["pageWidth"].as_f64().unwrap() - 100.0 / 25.4).abs() < 1e-9);
+    assert!((g["pageHeight"].as_f64().unwrap() - 148.0 / 25.4).abs() < 1e-9);
+    fails(&mut s, "print.set", json!({"layout": {"page": {"paper": "poster"}}}));
 }
 
 #[test]

@@ -266,8 +266,48 @@ fn catalog_verbatim(language: Locale) -> BTreeMap<String, &'static str> {
 // `locales/*-formats.json`.
 include!(concat!(env!("OUT_DIR"), "/tr-formats.rs"));
 
-/// A stock preset's or profile's name in the UI language; an imported or user-edited name stays
-/// exactly as its owner wrote it.
+/// The web build's notice for a dropped file the browser could not read.
+pub fn dropped_file_unreadable(name: &str, error: &str) -> String {
+    tr_format!("Could not read {name}: {e}", name = name, e = error)
+}
+
+/// The web build's notice for dropped files the library refused.
+pub fn dropped_import_failed(error: &str) -> String {
+    tr_format!("Import failed: {e}", e = error)
+}
+
+/// The web build's notice for `n` dropped photos that joined the library.
+pub fn dropped_photos_added(n: usize) -> String {
+    tr_format!("Added {n} photo{}", if n == 1 { "" } else { "s" }, n = n)
+}
+
+/// The web build's notice for `n` dropped photos that came back from Recently Deleted.
+pub fn dropped_photos_restored(n: usize) -> String {
+    tr_format!("Restored {} photo{} from Recently Deleted", n, if n == 1 { "" } else { "s" })
+}
+
+/// The web build's notice for what a drop of photos came to, from the `library.import` report: every outcome that
+/// happened (added, restored from Recently Deleted, not readable), joined with " · " as the desktop import's notice
+/// joins its parts, or `None` when none did (duplicates only).
+pub fn dropped_photos_outcome(report: &serde_json::Value) -> Option<String> {
+    let count = |k: &str| report[k].as_array().map_or(0, Vec::len);
+    let parts: Vec<String> = [
+        (count("imported"), dropped_photos_added as fn(usize) -> String),
+        (count("restored"), dropped_photos_restored),
+        (count("failed"), dropped_photos_unreadable),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, say)| say(n))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The web build's notice for `n` dropped photos that could not be read.
+pub fn dropped_photos_unreadable(n: usize) -> String {
+    tr_format!("{} photo{} not readable", n, if n == 1 { "" } else { "s" })
+}
+
 /// The title and text of the message box shown when the desktop app's window can't start
 /// (issue #260), in the UI language: the error and, when there is one, the log file to look in.
 pub fn startup_failed_message(error: &str, log_file: Option<&str>) -> (String, String) {
@@ -305,6 +345,8 @@ pub fn upper_first(text: &str) -> String {
     }
 }
 
+/// A stock preset's or profile's name in the UI language; an imported or user-edited name stays
+/// exactly as its owner wrote it.
 pub fn builtin_label(source: &str, builtin: bool) -> &str {
     if builtin { tr(source) } else { source }
 }
@@ -1107,6 +1149,20 @@ mod tests {
             let no = format!(" {}", bool_text_in(Locale::De, false));
             assert!(rules_label(&rules, &catalog).ends_with(&no), "{}", rules_label(&rules, &catalog));
         }
+        let both = lightcraft_catalog::Filter {
+            label: Some(lightcraft_catalog::ColorLabel::Red),
+            labels: vec![lightcraft_catalog::ColorLabel::Blue, lightcraft_catalog::ColorLabel::Red],
+            ..Default::default()
+        };
+        let name = |label| color_label(&app.session.catalog, label);
+        let (red, blue, green) =
+            (name(lightcraft_catalog::ColorLabel::Red), name(lightcraft_catalog::ColorLabel::Blue), name(lightcraft_catalog::ColorLabel::Green));
+        let (label, and, or) = (tr("Label"), tr("and"), tr("or"));
+        assert_eq!(filter_label(&both, &app.session.catalog), format!("{label}: {red}"));
+        let both = lightcraft_catalog::Filter { labels: vec![lightcraft_catalog::ColorLabel::Blue], ..both };
+        assert_eq!(filter_label(&both, &app.session.catalog), format!("{label}: {red} {and} {blue}"));
+        let both = lightcraft_catalog::Filter { labels: vec![lightcraft_catalog::ColorLabel::Blue, lightcraft_catalog::ColorLabel::Green], ..both };
+        assert_eq!(filter_label(&both, &app.session.catalog), format!("{label}: {red} {and} ({blue} {or} {green})"));
         let filter = lightcraft_catalog::Filter {
             labels: vec![lightcraft_catalog::ColorLabel::Red, lightcraft_catalog::ColorLabel::Blue],
             ..Default::default()
@@ -1623,6 +1679,95 @@ mod ",
         let call = concat!("tr_format", "!(");
         let source = format!("{call}\"Imported {{}} photo{{}}\", n, s); crate::i18n::{call}\n    \"Say \\\"hi\\\" \\u{{2192}}\", x); {call}name)");
         assert_eq!(tr_format_messages(&source), ["Imported {} photo{}", "Say \"hi\" →"]);
+    }
+
+    /// A drop's notice comes from what `library.import` reported: a photo added, one brought back from Recently
+    /// Deleted and a file that could not be read are each named; a drop of duplicates only says nothing.
+    #[test]
+    fn a_dropped_photos_notice_names_every_outcome_of_the_import_and_is_silent_for_duplicates_only() {
+        set_language(Locale::En);
+        let dir = std::env::temp_dir().join(format!("lc-drop-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = |name: &str, seed: u8| {
+            let data: Vec<[u8; 4]> = (0..48 * 32).map(|i| [(i % 48 * 5) as u8, (i / 48 * 7) as u8, seed, 255]).collect();
+            let img = lightcraft_raster::Rgba8 { width: 48, height: 32, data };
+            let bytes =
+                lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+            std::fs::write(dir.join(name), bytes).unwrap();
+            dir.join(name).to_string_lossy().into_owned()
+        };
+        let (trashed, added) = (png("trashed.png", 1), png("new.png", 2));
+        let broken = dir.join("broken.jpg");
+        std::fs::write(&broken, b"not a jpeg at all").unwrap();
+        let mut s = lightcraft_engine::Session::new().with_fs();
+        let r = s.execute("library.import", &serde_json::json!({"paths": [trashed]})).unwrap();
+        s.execute("photo.delete", &serde_json::json!({"ids": [r["imported"][0]]})).unwrap();
+        let report = s.execute("library.import", &serde_json::json!({"paths": [trashed, added, broken]})).unwrap();
+        assert_eq!(
+            dropped_photos_outcome(&report).as_deref(),
+            Some("Added 1 photo · Restored 1 photo from Recently Deleted · 1 photo not readable"),
+            "{report}"
+        );
+        let again = s.execute("library.import", &serde_json::json!({"paths": [added]})).unwrap();
+        assert_eq!(dropped_photos_outcome(&again), None, "a duplicate only: {again}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Polish: the menu and control channel select it, dates read day.month.year, and every count
+    /// reads right for any number. Polish has three plural forms (1 zdjęcie, 2 zdjęcia, 5 zdjęć), so
+    /// counts follow their noun ("Zaimportowane zdjęcia: 22") instead of a form that fits only some.
+    #[test]
+    fn polish_switches_formats_dates_and_reads_every_count() {
+        use crate::control::{ControlRequest, Outcome};
+        let mut app = crate::LightcraftApp::new(lightcraft_engine::Session::with_demo(), Default::default());
+        app.run("app.language.polish", serde_json::json!({})).unwrap();
+        assert_eq!(app.ui.language, Locale::Pl);
+        assert_eq!(Locale::Pl.name(), "Polski");
+        assert_eq!(crate::menubar::checked(&app, "app.language.polish"), Some(true));
+        assert_eq!(tr("File"), "Plik");
+        assert_eq!(tr("Exposure"), "Ekspozycja");
+        assert_eq!(date_group_label("2026-09-20", false), "Niedziela, 20.09.2026");
+        assert_eq!(date_group_label("2026-09-20", true), "Niedziela, 20");
+        assert_eq!(date_group_label("2026-09", false), "09.2026");
+        assert_eq!(date_group_label("2026", false), "2026");
+        assert_eq!(display_time("2026-09-20T16:04:05"), "Niedziela, 20.09.2026 16:04:05");
+        for n in [0, 1, 2, 3, 4, 5, 12, 21, 22, 25, 111] {
+            let s = if n == 1 { "" } else { "s" };
+            assert_eq!(tr_format!("Imported {} photo{}", n, s), format!("Zaimportowane zdjęcia: {n}"));
+            for (one, many, noun) in [
+                ("photo waiting", "photos waiting", "Oczekujące zdjęcia"),
+                ("cached picture", "cached pictures", "Obrazy w pamięci podręcznej"),
+                ("photo has its denoised picture.", "photos have their denoised picture.", "Zdjęcia z odszumioną wersją"),
+            ] {
+                assert_eq!(tr_format!("{n} {noun}", n = n, noun = tr(if n == 1 { one } else { many })), format!("{noun}: {n}"));
+            }
+            assert_eq!(tr_format!("Delete {n} Photos", n = n), format!("Usuń zdjęcia ({n})"));
+            assert_eq!(tr_format!("{n} preset{}", s, n = n), format!("Ustawienia: {n}"));
+        }
+        let name = String::from("Color 1234.56 {title} 日本語");
+        assert_eq!(tr_format!("Added {n} photo{} to “{}”", "s", name, n = 22), format!("Dodano do „{name}”: 22"));
+        let saved = serde_json::to_string(&app.ui).unwrap();
+        assert_eq!(serde_json::from_str::<crate::state::UiState>(&saved).unwrap().language, Locale::Pl);
+        let ctx = egui::Context::default();
+        for tag in ["pl", "pl-PL", "pl_PL.UTF-8", "PL-pl"] {
+            assert_eq!(Locale::parse_tag(tag), Some(Locale::Pl), "{tag}");
+            let (request, _) = ControlRequest::new("ui.set", serde_json::json!({"language": tag}));
+            let Outcome::Done(reply) = crate::control::handle(&mut app, &ctx, &request) else { panic!("expected reply") };
+            assert_eq!(reply["ok"], true);
+            assert_eq!(language(), Locale::Pl);
+        }
+        let text = painted_text(&ctx, &mut app, Locale::Pl);
+        assert!(text.contains("Plik") && text.contains("Ekspozycja"), "{text}");
+        ctx.fonts_mut(|fonts| {
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Name(crate::theme::FONT_SEMIBOLD.into())] {
+                let font = egui::FontId::new(13.0, family);
+                for ch in "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ„”".chars() {
+                    assert!(fonts.has_glyph(&font, ch), "missing Polish glyph {ch}");
+                }
+            }
+        });
+        set_language(Locale::En);
     }
 }
 
