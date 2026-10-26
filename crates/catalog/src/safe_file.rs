@@ -268,30 +268,30 @@ fn same_content(path: &Path, data: &[u8]) -> io::Result<bool> {
 }
 
 /// Do `a` and `b` name the same existing file (through links, `..`, case-insensitive names)?
-pub fn same_file(a: &Path, b: &Path) -> bool {
+/// Return an error when either file cannot be opened or inspected; an unverified identity
+/// must never be treated as a confirmed nonmatch by a write guard.
+pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     #[cfg(windows)]
     {
         // Canonical paths preserve distinct hard-link names. Compare volume/file identities
         // through safe handles so differently named originals remain protected on Windows.
-        same_file::is_same_file(a, b).unwrap_or(false)
+        same_file::is_same_file(a, b)
     }
     #[cfg(not(windows))]
     {
-        let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+        let (ma, mb) = (fs::metadata(a)?, fs::metadata(b)?);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            ma.dev() == mb.dev() && ma.ino() == mb.ino()
+            Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
         }
         #[cfg(not(unix))]
         {
             if ma.len() != mb.len() {
-                return false;
+                return Ok(false);
             }
-            match (fs::canonicalize(a), fs::canonicalize(b)) {
-                (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
-                _ => false,
-            }
+            let (x, y) = (fs::canonicalize(a)?, fs::canonicalize(b)?);
+            Ok(x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase())
         }
     }
 }
@@ -413,14 +413,15 @@ mod tests {
         fs::write(&p, b"x").unwrap();
         fs::write(d.join("y.jpg"), b"x").unwrap();
         fs::create_dir_all(d.join("sub")).unwrap();
-        assert!(same_file(&p, &d.join("sub/../x.jpg")));
-        assert!(!same_file(&p, &d.join("y.jpg")));
-        assert!(!same_file(&p, &d.join("missing.jpg")));
+        assert!(same_file(&p, &d.join("sub/../x.jpg")).unwrap());
+        assert!(!same_file(&p, &d.join("y.jpg")).unwrap());
+        assert_eq!(same_file(&p, &d.join("missing.jpg")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(same_file(&d.join("missing.jpg"), &p).unwrap_err().kind(), io::ErrorKind::NotFound);
         #[cfg(any(unix, windows))]
         {
             let linked = d.join("another-name.jpg");
             fs::hard_link(&p, &linked).unwrap();
-            assert!(same_file(&p, &linked) && same_file(&linked, &p));
+            assert!(same_file(&p, &linked).unwrap() && same_file(&linked, &p).unwrap());
         }
         let _ = fs::remove_dir_all(&d);
     }
