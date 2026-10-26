@@ -10,6 +10,7 @@ var<workgroup> visited: atomic<u32>;
 
 @compute @workgroup_size(256)
 fn summary_partial(@builtin(local_invocation_index) lane: u32, @builtin(workgroup_id) group: vec3<u32>) {
+    // Count all pixels for validation; sample crop-anchored histogram bins within each group.
     for (var c = 0u; c < 4u; c++) {
         atomicStore(&bins[c * 256u + lane], 0u);
     }
@@ -60,6 +61,7 @@ fn summary_partial(@builtin(local_invocation_index) lane: u32, @builtin(workgrou
 
 @compute @workgroup_size(256)
 fn summary_reduce(@builtin(global_invocation_id) g: vec3<u32>) {
+    // Sum each bin/counter across the bounded partials into the compact readback buffer.
     let bin = g.x;
     if (bin >= SUMMARY_WORDS) {
         return;

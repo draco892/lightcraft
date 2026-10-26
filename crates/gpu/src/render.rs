@@ -163,6 +163,8 @@ impl<'a> Cx<'a> {
         self.gpu.finish_and_read(enc, b, len)
     }
 
+    /// Submit pending work and read `len` 32-bit words plus a summary in one map/wait.
+    /// The first result is decoded as `T`; readback failures are recorded on this render.
     pub fn read_with_tail<T: bytemuck::Pod>(&mut self, b: &Buf, len: usize, tail: &Buf) -> (Vec<T>, Vec<u32>) {
         self.pending = 0;
         let enc = self.enc.take().unwrap_or_else(|| self.gpu.encoder());

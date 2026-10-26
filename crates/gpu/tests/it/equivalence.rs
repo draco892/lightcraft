@@ -70,6 +70,7 @@ fn diff(a: &Rgba8, b: &Rgba8) -> (f64, u8, f64) {
     (sum as f64 / n, max, over as f64 / n)
 }
 
+/// Require CPU/GPU pixel equivalence and an exact CPU histogram of the GPU's output pixels.
 fn check(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> (f64, u8) {
     let cpu = render(src, info, s, req).image;
     let gpu = lightcraft_gpu::render(src, info, s, req, None).expect("gpu render");

@@ -35,6 +35,7 @@ fn masked(s: &mut DevelopSettings, k: usize) {
     }
 }
 
+/// Inject render and summary failures, requiring CPU recovery and the appropriate GPU retry policy.
 #[test]
 fn failed_gpu_renders_fall_back_with_a_reason() {
     if !lightcraft_gpu::available() {

@@ -1,6 +1,6 @@
 # GPU develop pipeline (M5.2)
 
-> **Last updated:** 2026-10-24 · #2783: GPU histogram and result-validation reductions.
+> **Last updated:** 2026-10-26 · #2783: GPU reduction contracts and Windows Vulkan / DX12 verification.
 
 The CPU pipeline (`crates/pipeline`) is the reference ("oracle"). `lightcraft-gpu` (`crates/gpu`, L3)
 evaluates the same stages with wgpu compute shaders (WGSL) on Metal / Vulkan / DX12. Everything is
@@ -368,8 +368,43 @@ renders gave **33 CPU/GPU comparisons**, max 1 LSB and worst mean 0.000098 LSB p
 Every GPU histogram exactly matched the CPU histogram of the same output pixels; repeating each
 GPU render with a warm stage cache produced identical pixels and histogram. Originals were read
 only, and no private media or sidecars were added to the repository. The opt-in test below repeats
-these assertions on a caller-selected NEF directory. These runs verify Metal; Vulkan and DX12
-runtime verification remains required on machines with those backends.
+these assertions on a caller-selected NEF directory. These RAW runs verify Metal; the procedural
+Windows checks below separately verify the new reduction and readback paths on Vulkan and DX12.
+
+### Windows backend verification (2026-10-26)
+
+Windows, Intel(R) Graphics, driver **32.0.101.8831**, Rust **1.99.0**, native MSVC test profile:
+the reduction tests passed on both **DX12** (the default FXC compiler) and **Vulkan**
+(reported driver: Intel Corporation 101.8831). Each backend ran three tests with no failures
+or GPU skips; the performance benchmark remained ignored. The GPU test prints the selected
+adapter, backend and driver so a successful CPU-only run cannot be mistaken for backend evidence.
+
+The checks require exact CPU histograms for 1 × 1 through 2101 × 2003 images, sampling-step
+boundaries, offset crops and constant colours. They exercise both summary-only and combined
+pixel/summary readback, count invalid alpha outside the sampled region, reject corrupt or
+incomplete summaries, and reject oversized readback requests without panicking. These checks
+verify the reduction shaders and readback path, not RAW colour fidelity on every driver.
+
+Reproduce in PowerShell, running each command in a separate test process:
+
+```powershell
+$env:LIGHTCRAFT_GPU_BACKEND = 'dx12'
+cargo test -p lightcraft-gpu --lib reduction::tests:: -- --nocapture
+$env:LIGHTCRAFT_GPU_BACKEND = 'vulkan'
+cargo test -p lightcraft-gpu --lib reduction::tests:: -- --nocapture
+Remove-Item Env:LIGHTCRAFT_GPU_BACKEND
+```
+
+`cargo xtask ci --hardware` additionally probes all compiled backends, runs the GPU suite on
+each backend with a hardware adapter, and records results in `target/ci/report.json` and
+`target/ci/summary.md`. Check the skip report as well as the test exit status on other machines.
+
+On this Windows host, all nine steps passed: fmt, clippy (`-D warnings`), HEIF, workspace tests
+and doctests, GPU backends (including Vulkan and DX12), parity, layers, assets and WASM. The run
+also exposed Windows-only test assumptions about unused Unix variables, path separators, TCP
+reset on unread pipelined input, and reading an empty locked file; these were corrected in test
+code without changing production behaviour. Optional corpus, font and model checks still skip
+when their inputs are absent.
 
 ### Reproducing the measurements
 

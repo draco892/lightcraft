@@ -63,6 +63,8 @@ impl Reduction {
     }
 }
 
+/// Decode exactly one summary, requiring complete pixel coverage and the expected sampled
+/// total in every channel. Invalid lengths, counters or bin sums return an error.
 fn decode(words: &[u32], pixels: u32, samples: u32) -> Result<Summary, String> {
     let malformed = || "incomplete or inconsistent histogram/validation reduction".to_string();
     if words.len() != WORDS {
@@ -86,6 +88,7 @@ mod tests {
     use crate::ctx::{ErrorScopes, RenderScope};
     use lightcraft_raster::Rgba8;
 
+    /// Reject truncated, dropped and corrupt summaries without overflowing bin totals.
     #[test]
     fn malformed_or_dropped_summaries_are_rejected() {
         assert!(decode(&[], 5, 5).is_err());
@@ -104,6 +107,7 @@ mod tests {
         assert!(decode(&words, 5, 5).is_err());
     }
 
+    /// Compare compact or paired readback with CPU histogram sampling and full-image alpha counts.
     fn check(cx: &mut Cx<'_>, image: &Rgba8, keep: Option<PixelWindow>, pixels_too: bool) {
         let source = cx.gpu.upload(&image.data);
         let reduction = Reduction::encode(cx, &source, image.width, image.height, keep).expect("valid dimensions");
@@ -121,6 +125,7 @@ mod tests {
         assert_eq!(summary.unwritten as usize, image.data.iter().filter(|p| p[3] != 255).count());
     }
 
+    /// Exercise sampling thresholds, offset crops, constant colours and unsampled invalid pixels.
     #[test]
     fn gpu_reduction_matches_cpu_sampling_and_validates_every_pixel() {
         let Some(gpu) = crate::device() else {
@@ -129,6 +134,7 @@ mod tests {
         };
         let _scope = RenderScope::new(gpu);
         let errors = ErrorScopes::push(gpu);
+        println!("reduction adapter: {} ({:?}); driver: {} {}", gpu.info.name, gpu.info.backend, gpu.info.driver, gpu.info.driver_info);
         let mut cx = Cx::new(gpu);
         for (w, h) in [(1, 1), (17, 19), (1000, 1000), (1001, 1000), (2101, 2003)] {
             let image = Rgba8::from_fn(w, h, |x, y| [(x % 256) as u8, (y % 256) as u8, ((x + 3 * y) % 256) as u8, 255]);
@@ -149,6 +155,7 @@ mod tests {
         assert!(errors.pop().is_none(), "GPU errors");
     }
 
+    /// A readback longer than its source must record a failure instead of panicking.
     #[test]
     fn malformed_readback_returns_an_error_instead_of_panicking() {
         let Some(gpu) = crate::device() else {
@@ -178,6 +185,7 @@ mod tests {
         let errors = ErrorScopes::push(gpu);
         let mut cx = Cx::new(gpu);
         let iterations = std::env::var("N").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20).clamp(1, 1000);
+        /// Warm up once and report the minimum wall-clock latency over `n` measured iterations.
         fn best(n: usize, mut f: impl FnMut()) -> f64 {
             f(); // warm up pipeline and pool
             (0..n)

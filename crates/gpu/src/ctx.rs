@@ -583,6 +583,9 @@ impl Gpu {
 
     /// Read pixels and an optional compact summary with a single submission, map and wait.
     /// A summary-only consumer can instead read its buffer through `finish_and_read`.
+    /// `len` counts 32-bit words; their byte length must be divisible by the size of `T`.
+    /// Invalid sizes record a fatal failure and return empty vectors. Device/map failures
+    /// return zero-filled vectors for the caller to discard after checking the render failure.
     pub fn finish_and_read_with_tail<T: bytemuck::Pod>(
         &self,
         mut enc: wgpu::CommandEncoder,

@@ -140,7 +140,9 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::ti
             if m.is_dir() {
                 todo.push(p.clone());
             }
-            let bytes = if m.is_file() { std::fs::read(&p).unwrap() } else { Vec::new() };
+            // Empty files have no bytes to read. Windows refuses even a read of the empty
+            // catalog.lock while its mandatory OS lock is held; metadata remains available.
+            let bytes = if m.is_file() && m.len() > 0 { std::fs::read(&p).unwrap() } else { Vec::new() };
             out.insert(p.strip_prefix(dir).unwrap().to_path_buf(), (bytes, m.modified().unwrap()));
         }
     }

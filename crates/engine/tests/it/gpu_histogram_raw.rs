@@ -8,6 +8,8 @@ use lightcraft_develop::DevelopSettings;
 use lightcraft_pipeline::{PixelWindow, RenderRequest, StageCache};
 use lightcraft_raster::Histogram;
 
+/// Check preview, offset-window and full-size renders against the CPU oracle, then require
+/// identical pixels and histograms on a warm cache. Reads only caller-supplied Nikon NEFs.
 #[test]
 #[ignore = "needs LC_HISTOGRAM_RAW_DIR pointing at private NEFs and a GPU"]
 fn private_nefs_match_cpu_and_keep_exact_histograms() {
