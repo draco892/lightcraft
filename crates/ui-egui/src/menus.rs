@@ -139,6 +139,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("local.addRoot", "Add Folder to Local", None, ""),
     ("local.hide", "Remove from Local", None, ""),
     ("local.restoreHidden", "Show Hidden Local Locations", None, ""),
+    // {on?}: the Info panel's Target Photo / Selected Photos choice (on = Selected Photos)
+    ("view.infoSelectedPhotos", "Show Metadata for Selected Photos", None, ""),
     ("view.fullScreenPreview", "Full Screen Preview", Some("F"), "View"),
     ("view.lightsOut", "Lights Out", Some("Shift+L"), "View"),
     ("view.enterFullScreen", "Enter Full Screen", Some("Cmd+Shift+F"), "View"),
@@ -158,6 +160,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("panel.presets", "Presets", Some("Shift+P"), "Window"),
     ("panel.info", "Info", Some("I"), "Window"),
     ("panel.keywords", "Keywords", Some("K"), "Window"),
+    // the Keywords panel with the cursor in its Add keyword box
+    ("panel.addKeywords", "Add Keywords", Some("Cmd+K"), ""),
     ("panel.versions", "Versions", Some("Shift+V"), "Window"),
     ("panel.activity", "History", None, "Window"),
     ("panel.close", "Close Panel", None, ""),
@@ -259,6 +263,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     // Settings ▸ Display
     ("app.displayProfile", "Display Profile", None, ""),
     ("app.about", "About LightCraft", None, "Help"),
+    ("app.checkForUpdates", "Check for Updates…", None, "Help"),
     ("app.systemInfo", "System Info…", None, "Help"),
     ("app.openLogFolder", "Open Log Folder", None, "Help"),
     // the frame-rate display (`frame_rate`): a debugging aid, never saved
@@ -663,8 +668,9 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             } else if app.ui.keyword_painter.is_some() {
                 app.ui.keyword_painter = None;
             } else if app.ui.fullscreen {
-                app.ui.fullscreen = false;
-                app.ui.slideshow = None;
+                // Through `slideshow::end`: it also releases the held slide textures. Clearing the
+                // two fields directly left every rendered slide in the renderer.
+                crate::panels::slideshow::end(app);
             } else if !app.ui.tool.is_empty() {
                 app.ui.tool.clear();
             } else if app.ui.right == RightPanel::Crop && app.ui.view == ViewMode::Detail {
@@ -688,7 +694,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         }
         "view.slideshow" => {
             // the photos in view, full screen, with the playback settings (see panels::slideshow)
-            let now = ctx.input(|i| i.time);
+            let now = app.tick_now();
             let r = crate::panels::slideshow::start(app, p, now);
             if r.is_ok() {
                 app.toast(&ctx, crate::i18n::tr("Slideshow · Space pauses · Esc ends"));
@@ -696,7 +702,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             r
         }
         "slideshow.togglePause" | "slideshow.next" | "slideshow.previous" | "slideshow.end" => {
-            let now = ctx.input(|i| i.time);
+            let now = app.tick_now();
             crate::panels::slideshow::command(app, id, now)
         }
         "view.slideshowOptions" => {
@@ -704,11 +710,12 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             Ok(Value::Null)
         }
         "view.fullScreenPreview" => {
-            app.ui.fullscreen = !app.ui.fullscreen;
-            if !app.ui.fullscreen {
-                app.ui.slideshow = None;
-            }
             if app.ui.fullscreen {
+                // Through `slideshow::end`: it also releases the held slide textures. Clearing the
+                // two fields directly left every rendered slide in the renderer.
+                crate::panels::slideshow::end(app);
+            } else {
+                app.ui.fullscreen = true;
                 app.ui.zoom = Zoom::Fit;
                 app.ui.tool.clear();
                 let _ = app.session.end_interaction();
@@ -749,9 +756,22 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             Ok(json!({"infoOverlay": app.ui.info_overlay}))
         }
         "view.viewOptions" => {
-            // `info1` / `info2` set the lines for an agent; without them the window opens
+            // `info1` / `info2` set the lines, `briefly` the Info that Show Briefly When Photo Changes
+            // shows and `loupeMessages` Show message when loading or rendering photos, for an agent;
+            // without any of them the window opens
             let mut info = app.ui.settings.loupe_info;
             let mut set = false;
+            // `loupeMessages` sets Show message when loading or rendering photos
+            let messages = match p.get("loupeMessages") {
+                None => app.ui.settings.loupe_messages,
+                Some(v) => match v.as_bool() {
+                    Some(on) => {
+                        set = true;
+                        on
+                    }
+                    None => return Some(Err("`loupeMessages`: true|false".into())),
+                },
+            };
             for (key, lines) in [("info1", &mut info.info1), ("info2", &mut info.info2)] {
                 let Some(v) = p.get(key) else { continue };
                 match serde_json::from_value(v.clone()) {
@@ -762,12 +782,20 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 }
                 set = true;
             }
+            if let Some(v) = p.get("briefly") {
+                match serde_json::from_value(v.clone()) {
+                    Ok(v) => info.briefly = v,
+                    Err(_) => return Some(Err("`briefly`: off|basic|exposure (neither, Info 1 or Info 2)".into())),
+                }
+                set = true;
+            }
             if set {
                 app.ui.settings.loupe_info = info;
+                app.ui.settings.loupe_messages = messages;
             } else {
                 app.ui.dialog = Some(Dialog::ViewOptions);
             }
-            Ok(json!({"loupeInfo": app.ui.settings.loupe_info}))
+            Ok(json!({"loupeInfo": app.ui.settings.loupe_info, "loupeMessages": app.ui.settings.loupe_messages}))
         }
         "view.chooseLayoutImage" => {
             let path = match p.get("path").and_then(Value::as_str) {
@@ -865,7 +893,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                     app.ui.tool.clear();
                 }
                 let _ = app.session.end_interaction();
-            } else {
+            } else if app.ui.right == RightPanel::None {
                 let p = match std::mem::take(&mut app.ui.right_hidden) {
                     RightPanel::None => RightPanel::Edit,
                     p => p,
@@ -878,6 +906,8 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                     app.ui.tool = "remove".into();
                 }
             }
+            // A right panel that is open but not showing (minimized, or behind another tab)
+            // keeps its mode; reveal_command brings it to the front.
             Ok(json!({"open": app.ui.right != RightPanel::None}))
         }
         "view.beforeAfter" => {
@@ -1114,6 +1144,16 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             app.ui.mask_pins = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.mask_pins);
             Ok(json!({"maskPins": app.ui.mask_pins}))
         }
+        "view.infoSelectedPhotos" => {
+            // {on?}; no params toggles. On: the Info panel shows what the selected photos share.
+            let on = match p.get("on") {
+                None | Some(Value::Null) => !app.ui.settings.info_selected_photos,
+                Some(Value::Bool(on)) => *on,
+                Some(v) => return Some(Err(format!("view.infoSelectedPhotos: `on` must be true or false, not {v}"))),
+            };
+            app.ui.settings.info_selected_photos = on;
+            Ok(json!({"on": on}))
+        }
         "view.toolOverlay" => {
             use crate::state::ToolOverlay;
             let mode = match p.get("mode") {
@@ -1240,6 +1280,15 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
         }
         "panel.keywords" => {
             panel(app, &ctx, RightPanel::Keywords, "Keywords");
+            Ok(Value::Null)
+        }
+        "panel.addKeywords" => {
+            // opens Keywording when it is folded shut; the panel stays open when pressed again
+            if app.ui.right != RightPanel::Keywords {
+                panel(app, &ctx, RightPanel::Keywords, "Keywords");
+            }
+            app.ui.folded_sections.retain(|s| s != "keywording");
+            app.ui.focus_keywords = Some(ctx.cumulative_pass_nr());
             Ok(Value::Null)
         }
         "panel.versions" => {
@@ -1541,6 +1590,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             app.ui.dialog = Some(Dialog::About);
             Ok(Value::Null)
         }
+        "app.checkForUpdates" => crate::updates_ui::check(app),
         "photo.editInPhotoCraft" => edit_in(app, &ctx, p, true),
         "photo.editInExternal" => edit_in(app, &ctx, p, false),
         "photo.openOriginalInExternal" => open_original_in(app, &ctx, p),

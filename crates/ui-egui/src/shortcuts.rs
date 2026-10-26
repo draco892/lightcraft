@@ -54,13 +54,28 @@ pub fn find_bindable(id: &str) -> Option<&'static Bindable> {
 
 /// The shortcut `id` has now: the user's choice (`""` = none), else the declared one. An entry
 /// that doesn't parse (a hand-edited `ui.json`, a modifier-only key saved by an older build) is
-/// ignored.
+/// ignored. The declared shortcut yields to a saved entry that gives its key to another known
+/// command other than its contextual partner.
 pub fn binding<'a>(keymap: &'a Keymap, id: &str, default: Option<&'a str>) -> Option<&'a str> {
     match keymap.get(id) {
         Some(sc) if sc.is_empty() => None,
         Some(sc) if parse(sc).is_some() => Some(sc.as_str()),
-        _ => default,
+        _ => default.filter(|sc| !assigned_elsewhere(keymap, id, sc)),
     }
+}
+
+/// Whether the keymap gives the key `sc` to a known command other than `id` and its contextual
+/// partner.
+fn assigned_elsewhere(keymap: &Keymap, id: &str, sc: &str) -> bool {
+    let Some(key) = parse(sc) else { return false };
+    saved_keys(keymap)
+        .any(|(other, k)| other != id && k == key && !CONTEXTUAL.iter().any(|(x, y)| (*x == id && *y == other) || (*y == id && *x == other)))
+}
+
+/// The keys the keymap gives to known commands, with each command's id. Entries for commands this
+/// build doesn't know and entries that don't parse are ignored.
+pub(crate) fn saved_keys(keymap: &Keymap) -> impl Iterator<Item = (&str, (Modifiers, Key))> {
+    keymap.iter().filter(|(id, _)| find_bindable(id).is_some()).filter_map(|(id, sc)| Some((id.as_str(), parse(sc)?)))
 }
 
 /// The effective shortcut of command `id` (`None` for unknown commands).
@@ -334,11 +349,10 @@ fn keyboard_owned(app: &LightcraftApp, ctx: &egui::Context) -> bool {
             [Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown, Key::Enter, Key::Space].iter().any(|key| input.key_pressed(*key))
         });
     }
-    let chrome = app
-        .ui
-        .docking
-        .as_ref()
-        .is_some_and(|workspace| craft_ui::docking::DockArea::new(egui::Id::new("lightcraft-docking")).chrome_has_focus(ctx, &workspace.layout));
+    let chrome =
+        app.ui.docking.as_ref().is_some_and(|workspace| {
+            craft_ui::docking::DockArea::new(egui::Id::unique("lightcraft-docking")).chrome_has_focus(ctx, &workspace.layout)
+        });
     if !chrome {
         return true;
     }
@@ -349,12 +363,20 @@ fn keyboard_owned(app: &LightcraftApp, ctx: &egui::Context) -> bool {
     })
 }
 
+/// Dispatch the global shortcut pass. It yields while a dialog, prompt, blocking library window,
+/// text field, name edit or shortcut recording owns input, then fires saved command bindings,
+/// aliases and fixed photo keys, respecting native menu ownership and open popups.
 pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
     if !matches!(app.ui.dialog, Some(crate::state::Dialog::Shortcuts)) {
         app.recording_shortcut = None;
     }
-    // Dialogs own their keys (including Esc and text editing); background photo actions wait.
-    if app.ui.dialog.is_some() {
+    // Dialogs own their keys (including Esc and text editing); background photo actions wait. A
+    // quit prompt or settings notice owns every key too: its Foreground dim only blocks the
+    // pointer, so without this a rating or navigation shortcut would still act behind it. The
+    // blocking library window (error or launch list) owns all app shortcuts for every settled
+    // frame, not only its shield pass; its own list keys are consumed earlier by
+    // `library_problem::logic`, and its buttons remain reachable through the control channel.
+    if app.ui.dialog.is_some() || crate::panels::notices::blocks_input(app) || crate::panels::library_problem::blocks_dialog_input(app) {
         return;
     }
     if app.recording_shortcut.is_none() && app.ui.name_edit.is_none() && crate::panels::person::handle_bulk_key(app, ctx) {
@@ -373,8 +395,8 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
     // The grid navigation keys act on the photos in view, so they wait while the full-screen preview
     // covers the grid: a key must not move the selection onto photos nobody can see.
     let grid_navigation = grid && !app.ui.fullscreen;
-    // keys the user gave to a command: the fixed bindings below (aliases, ratings) yield to them
-    let taken: Vec<(Modifiers, Key)> = keymap.values().filter_map(|s| parse(s)).collect();
+    // keys the user gave to a known command: the fixed bindings below (aliases, ratings) yield to them
+    let taken: Vec<(Modifiers, Key)> = saved_keys(keymap).map(|(_, k)| k).collect();
     // an open popup (a menu, a date picker's calendar) closes on Esc itself: Esc's command (Back,
     // which also closes dialogs) waits until nothing is open
     let popup_open = egui::Popup::is_any_open(ctx);
@@ -828,6 +850,50 @@ mod tests {
         }
     }
 
+    /// A saved keymap entry that gives a key to one command (kept from before another command
+    /// declared that key) wins: the press runs that command alone, and the other command's declared
+    /// key comes back once the entry is gone.
+    #[test]
+    fn a_saved_key_wins_over_another_commands_declared_key() {
+        use lightcraft_catalog::{Flag, PhotoId};
+        let mut h = library();
+        h.app.ui.settings.keymap.insert("photo.increaseRating".into(), "P".into());
+        assert_eq!(super::shortcut_of(&h.app.ui.settings.keymap, "photo.pick"), None);
+        assert_eq!(super::conflicts(&h.app.ui.settings.keymap, "view.survey", "P"), vec!["photo.increaseRating"]);
+        key(&mut h, "P", false);
+        let photo = h.app.session.catalog.photo(PhotoId(1)).unwrap();
+        assert_eq!(photo.rating, 1, "the saved key raised the rating");
+        assert_eq!(photo.flag, Flag::None, "Flag as Pick's declared key yielded");
+        // with the entry gone, P picks again
+        h.app.ui.settings.keymap.remove("photo.increaseRating");
+        assert_eq!(super::shortcut_of(&h.app.ui.settings.keymap, "photo.pick"), Some("P"));
+        key(&mut h, "P", false);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().flag, Flag::Pick);
+        // a contextual partner's saved key does not silence the other side
+        h.app.ui.settings.keymap.insert("crop.rotateAspect".into(), "X".into());
+        assert_eq!(super::shortcut_of(&h.app.ui.settings.keymap, "photo.reject"), Some("X"));
+        // nor does an entry for a command this build doesn't know
+        h.app.ui.settings.keymap.insert("no.suchCommand".into(), "U".into());
+        assert_eq!(super::shortcut_of(&h.app.ui.settings.keymap, "photo.unflag"), Some("U"));
+    }
+
+    /// Keymap entries for commands this build doesn't know take no key: an alias, a rating key and
+    /// a declared shortcut on the same keys keep working.
+    #[test]
+    fn junk_keymap_entries_leave_aliases_ratings_and_declared_keys() {
+        use lightcraft_catalog::{Flag, PhotoId};
+        let mut h = library();
+        for (id, sc) in [("no.suchCommand", "Shift+X"), ("no.otherCommand", "5"), ("no.thirdCommand", "P")] {
+            h.app.ui.settings.keymap.insert(id.into(), sc.into());
+        }
+        key(&mut h, "5", false);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().rating, 5, "5 still rates");
+        key(&mut h, "P", false);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().flag, Flag::Pick, "P still picks");
+        key(&mut h, "X", true);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().flag, Flag::Reject, "Shift+X still rejects");
+    }
+
     #[test]
     fn classic_f6_and_f7_toggle_the_filmstrip_and_left_panel() {
         let mut h = library();
@@ -861,6 +927,24 @@ mod tests {
         h.app.ui.right_hidden = RightPanel::None;
         key(&mut h, "F8", false);
         assert_eq!(h.app.ui.right, RightPanel::Edit);
+    }
+
+    /// F8 on a minimized Tools window opens it again in the mode it had.
+    #[test]
+    fn classic_f8_shows_a_minimized_tools_window_and_keeps_its_mode() {
+        use crate::{docking::Panel, state::RightPanel};
+        let mut h = library();
+        h.app.ui.view = crate::state::ViewMode::Detail;
+        h.app.ui.right = RightPanel::Edit;
+        h.settle(std::time::Duration::from_secs(10));
+        h.app.run("ui.dock", json!({"operation": "float", "panel": "tools", "rect": [400, 100, 320, 500]})).unwrap();
+        h.app.run("ui.dock", json!({"action": {"SetMinimized": {"panel": "tools", "minimized": true}}})).unwrap();
+        h.app.ui.right = RightPanel::Crop;
+        h.step();
+        assert!(!crate::docking::exposed(&h.app, Panel::Tools));
+        key(&mut h, "F8", false);
+        assert_eq!(h.app.ui.right, RightPanel::Crop);
+        assert!(crate::docking::exposed(&h.app, Panel::Tools), "the window opens");
     }
 
     #[test]
@@ -1288,7 +1372,7 @@ mod tests {
                     },
                     |ui| {
                         let ctx = ui.ctx();
-                        egui::Popup::open_id(ctx, egui::Id::new("issue1771-menu"));
+                        egui::Popup::open_id(ctx, egui::Id::unique("issue1771-menu"));
                         assert!(egui::Popup::is_any_open(ctx));
                         super::super::handle(&mut h.app, ctx);
                     },

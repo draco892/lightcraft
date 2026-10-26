@@ -23,7 +23,7 @@
 //!   replacing anything** (a hard link, which fails on a taken name; where the volume has no hard
 //!   links, an exclusive create that claims the name, then a rename over that placeholder).
 //! - [`same_file`] tells whether two paths name the same file on disk (device + inode on Unix,
-//!   resolved paths elsewhere), for "is this target an original?" checks.
+//!   file handles on Windows, resolved paths elsewhere), for "is this target an original?" checks.
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
@@ -269,20 +269,29 @@ fn same_content(path: &Path, data: &[u8]) -> io::Result<bool> {
 
 /// Do `a` and `b` name the same existing file (through links, `..`, case-insensitive names)?
 pub fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::MetadataExt;
-        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+        // Canonical paths preserve distinct hard-link names. Compare volume/file identities
+        // through safe handles so differently named originals remain protected on Windows.
+        same_file::is_same_file(a, b).unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(windows))]
     {
-        if ma.len() != mb.len() {
-            return false;
+        let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ma.dev() == mb.dev() && ma.ino() == mb.ino()
         }
-        match (fs::canonicalize(a), fs::canonicalize(b)) {
-            (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
-            _ => false,
+        #[cfg(not(unix))]
+        {
+            if ma.len() != mb.len() {
+                return false;
+            }
+            match (fs::canonicalize(a), fs::canonicalize(b)) {
+                (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
+                _ => false,
+            }
         }
     }
 }
@@ -407,6 +416,12 @@ mod tests {
         assert!(same_file(&p, &d.join("sub/../x.jpg")));
         assert!(!same_file(&p, &d.join("y.jpg")));
         assert!(!same_file(&p, &d.join("missing.jpg")));
+        #[cfg(any(unix, windows))]
+        {
+            let linked = d.join("another-name.jpg");
+            fs::hard_link(&p, &linked).unwrap();
+            assert!(same_file(&p, &linked) && same_file(&linked, &p));
+        }
         let _ = fs::remove_dir_all(&d);
     }
 }

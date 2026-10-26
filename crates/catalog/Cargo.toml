@@ -20,6 +20,9 @@ log = { workspace = true }
 chrono = { workspace = true }
 web-time = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+same-file = { workspace = true }
+
 [dev-dependencies]
 lightcraft-geom = { workspace = true }
 proptest = { workspace = true }

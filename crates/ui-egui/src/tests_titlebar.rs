@@ -169,3 +169,25 @@ fn full_screen_moves_the_left_buttons_into_the_traffic_lights_space() {
     assert!(!h.app.window_is_fullscreen);
     assert_eq!(widget(&h, "icon:sidebar").left(), windowed, "leaving full screen restores the room for the traffic lights");
 }
+
+// Scenario: a panel floating over the bar keeps a drag on it from moving the window (macOS's
+// title-bar band would otherwise take the drag); a bar control does too
+#[test]
+fn a_panel_floating_over_the_bar_keeps_the_window_from_moving() {
+    let mut h = integrated();
+    let bar = widget(&h, "region:titlebar");
+    let empty = empty_spot(&h);
+    let hover = |h: &mut Headless, p: egui::Pos2| {
+        h.events.push(egui::Event::PointerMoved(p));
+        play(h);
+        craft_window::title_bar::window_movable(&h.view.ctx)
+    };
+    assert!(hover(&mut h, empty), "the empty bar moves the window");
+    let help = widget(&h, "icon:help").center();
+    assert!(!hover(&mut h, help), "a bar control");
+    let params = json!({"operation": "float", "panel": "tools", "rect": [bar.left(), bar.top() + 4.0, 330.0, 500.0]});
+    let r = h.request("engine.execute", json!({"command": "ui.dock", "params": params}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    play(&mut h);
+    assert!(!hover(&mut h, empty), "the floating panel covers the empty bar there");
+}

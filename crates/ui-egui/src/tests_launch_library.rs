@@ -129,8 +129,8 @@ fn the_list_checks_each_library_and_selects_the_last_one() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every file under `dir`: relative path → (contents, modification time).
-fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+/// Every file under `dir`: relative path → (contents, length, modification time).
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Option<Vec<u8>>, u64, std::time::SystemTime)> {
     let mut out = std::collections::BTreeMap::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
@@ -140,13 +140,23 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::ti
             if m.is_dir() {
                 todo.push(p.clone());
             }
-            // Empty files have no bytes to read. Windows refuses even a read of the empty
-            // catalog.lock while its mandatory OS lock is held; metadata remains available.
-            let bytes = if m.is_file() && m.len() > 0 { std::fs::read(&p).unwrap() } else { Vec::new() };
-            out.insert(p.strip_prefix(dir).unwrap().to_path_buf(), (bytes, m.modified().unwrap()));
+            let (bytes, len) = if m.is_file() { (contents(&p), m.len()) } else { (Some(Vec::new()), 0) };
+            out.insert(p.strip_prefix(dir).unwrap().to_path_buf(), (bytes, len, m.modified().unwrap()));
         }
     }
     out
+}
+
+/// The bytes of the file `p`, or `None` for a lock file that a [`lightcraft_catalog::LibraryLock`]
+/// holds on Windows: there `LockFileEx` locks the file's bytes, and reading them through another
+/// handle fails with os error 33 (`ERROR_LOCK_VIOLATION`). Such a file is compared by its length
+/// and modification time only.
+fn contents(p: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(p) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if cfg!(windows) && e.raw_os_error() == Some(33) && p.file_name().is_some_and(|n| n == lightcraft_catalog::lock::LOCK) => None,
+        Err(e) => panic!("{}: {e}", p.display()),
+    }
 }
 
 /// Listing the recent libraries (and drawing the window) writes nothing into any of them: no
@@ -958,8 +968,19 @@ fn recent_libraries_are_checked_again_only_when_the_window_comes_back() {
 /// (FredApps on #2689, #2774).
 #[test]
 fn a_library_found_again_comes_back_to_the_launch_list() {
+    found_again(false);
+}
+
+/// The same when every frame is laid out twice (`request_discard`): an answer applied in a frame is
+/// visible through all of its passes, and scheduling does not ask about it again in that frame.
+#[test]
+fn a_library_found_again_comes_back_to_the_launch_list_across_a_multipass_frame() {
+    found_again(true);
+}
+
+fn found_again(multipass: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let dir = temp("found-again");
+    let dir = temp(if multipass { "found-again-multipass" } else { "found-again" });
     let a = make_library(&dir.join("A"));
     let plugged = std::sync::Arc::new(AtomicBool::new(false));
     let p = plugged.clone();
@@ -971,6 +992,21 @@ fn a_library_found_again_comes_back_to_the_launch_list() {
     app.ui.settings.recent_libraries = vec![a.clone()];
     app.library_problem = Some(LibraryProblem::choose_later(&app.ui.settings));
     let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+    if multipass {
+        // The existing context hook egui calls at the start of every pass: ask for the second layout
+        // pass on every pass 0 (which egui otherwise does only for e.g. a Grid sizing change).
+        h.view.ctx.on_begin_pass(
+            "test: force a second layout pass",
+            std::sync::Arc::new(|ui: &mut egui::Ui| {
+                if ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("test: force a second layout pass");
+                }
+            }),
+        );
+        let passes = h.view.ctx.cumulative_pass_nr();
+        h.step();
+        assert_eq!(h.view.ctx.cumulative_pass_nr() - passes, 2, "the hook forced the second pass");
+    }
     let row = |h: &Headless| h.app.library_problem.as_ref().and_then(|p| p.chooser.as_ref()).map(|c| c.libraries[0].clone()).unwrap();
     assert!(
         h.step_until(T, |h| {

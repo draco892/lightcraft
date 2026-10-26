@@ -13,7 +13,6 @@
 //!   is occluded.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -36,6 +35,10 @@ pub fn viewport_pixels(size: [f32; 2], pixels_per_point: f32) -> Result<[usize; 
     native_viewport_pixels(size, pixels_per_point)
 }
 
+/// Turn a logical viewport size into native pixels for the headless renderer. Both edges and
+/// the scale must be finite and positive; each scaled edge is rounded like egui's scissor and
+/// must be within `1..=MAX_IMAGE_EDGE`, and the product must fit both the raster and screenshot
+/// pixel budgets. Returns a user-facing error instead of clamping.
 fn native_viewport_pixels(size: [f32; 2], pixels_per_point: f32) -> Result<[usize; 2], String> {
     let [width, height] = size;
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 || !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
@@ -50,8 +53,11 @@ fn native_viewport_pixels(size: [f32; 2], pixels_per_point: f32) -> Result<[usiz
         Ok(pixels as usize)
     };
     let (w, h) = (axis(width)?, axis(height)?);
-    if w.checked_mul(h).is_none_or(|pixels| pixels > softpaint::MAX_IMAGE_PIXELS) {
-        return Err(format!("scaled viewport exceeds {} pixels", softpaint::MAX_IMAGE_PIXELS));
+    // The rasterizer's limit is not enough: a screenshot is also bounded by the RGBA budget it is
+    // admitted against, so reject a size `ui.screenshot` would only refuse later.
+    let max_pixels = softpaint::MAX_IMAGE_PIXELS.min(crate::MAX_SHOT_PIXELS);
+    if w.checked_mul(h).is_none_or(|pixels| pixels > max_pixels) {
+        return Err(format!("scaled viewport exceeds {max_pixels} pixels"));
     }
     Ok([w, h])
 }
@@ -156,7 +162,20 @@ impl HeadlessView {
                 self.clipboard.clone_from(text);
             }
         }
-        let commands = out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default();
+        let mut commands = out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default();
+        // 0.37: `ViewportCommand::Screenshot` carries a one-shot callback. A headless host answers
+        // it here, after the pass it was issued in, exactly once.
+        let mut shots = Vec::new();
+        commands.retain(|command| match command {
+            ViewportCommand::Screenshot(callback) => {
+                shots.push(callback.clone());
+                false
+            }
+            _ => true,
+        });
+        for callback in shots {
+            callback.complete(std::sync::Arc::new(self.paint(&std::collections::HashMap::new())));
+        }
         // what a desktop host does with a cut, copy or paste request (egui-winit): the event, next frame
         for c in &commands {
             match c {
@@ -246,6 +265,10 @@ pub struct Headless {
     pub window_commands: Vec<ViewportCommand>,
     /// The pointer cursor the last frame asked for (what a real host would show).
     pub last_cursor: egui::CursorIcon,
+    /// Test-only hook run after `raw_input_hook` and before `logic`/`ui`, as eframe does: it can
+    /// create a prompt after the host input was already filtered for the previous frame.
+    #[cfg(test)]
+    after_raw_input_hook: Option<Box<dyn FnMut(&mut LightcraftApp)>>,
 }
 
 /// A headless run (`lightcraft-cli snapshot`, tests) is a one-shot process: however it ends, it
@@ -286,7 +309,17 @@ impl Headless {
             window_maximized: false,
             window_commands: vec![],
             last_cursor: egui::CursorIcon::Default,
+            #[cfg(test)]
+            after_raw_input_hook: None,
         }
+    }
+
+    /// Run `hook` once, between the next frame's [`LightcraftApp::raw_input_hook`] and its
+    /// `logic`/`ui` call. This is the production order in eframe: a prompt can be created there
+    /// after the host input was already accepted for the frame.
+    #[cfg(test)]
+    pub(crate) fn set_after_raw_input_hook(&mut self, hook: impl FnMut(&mut LightcraftApp) + 'static) {
+        self.after_raw_input_hook = Some(Box::new(hook));
     }
 
     pub fn frames(&self) -> u64 {
@@ -315,7 +348,13 @@ impl Headless {
         raw.viewports.entry(ViewportId::ROOT).or_default().maximized = Some(self.window_maximized);
         raw.max_texture_side = (self.reported_texture_side != Some(self.max_texture_side)).then_some(self.max_texture_side);
         self.reported_texture_side = Some(self.max_texture_side);
-        self.app.raw_input_hook(&mut raw);
+        // A headless run's timers follow its simulated clock, not the host's wall clock.
+        self.app.set_simulated_clock(Some(self.time));
+        self.app.raw_input_hook(&self.view.ctx, &mut raw);
+        #[cfg(test)]
+        if let Some(mut hook) = self.after_raw_input_hook.take() {
+            hook(&mut self.app);
+        }
         let app = &mut self.app;
         let mut cursor = egui::CursorIcon::Default;
         let commands = self.view.run(raw, |ui| {
@@ -327,11 +366,10 @@ impl Headless {
         self.time += FRAME_DT;
         self.frames += 1;
         for c in commands {
+            // `ViewportCommand::Screenshot` never reaches here: `HeadlessView::run` answers the
+            // one-shot callback after the pass it was issued in, so there is exactly one reply.
             match c {
-                ViewportCommand::Screenshot(user_data) => {
-                    let image = Arc::new(self.paint());
-                    self.events.push(egui::Event::Screenshot { viewport_id: ViewportId::ROOT, user_data, image });
-                }
+                ViewportCommand::Screenshot(_) => {}
                 ViewportCommand::InnerSize(size) => {
                     // Viewport commands use current egui points, which include UI zoom.
                     if let Ok(native_size) = resized_viewport([size.x, size.y], self.pixels_per_point, self.view.ctx.zoom_factor()) {
@@ -364,6 +402,7 @@ impl Headless {
             || self.app.session.denoise_busy()
             || !self.app.tasks.is_empty()
             || !self.app.synthetic.is_empty()
+            || !self.app.pending_gestures.is_empty()
             || !self.events.is_empty()
     }
 
@@ -599,6 +638,7 @@ mod tests {
     }
 
     use super::*;
+    use std::sync::Arc;
 
     /// The pretend host has a clipboard, as a desktop does: text the UI copies lands in it, and a
     /// cut, copy or paste request (from a context menu) comes back as that event on the next frame.
@@ -630,7 +670,9 @@ mod tests {
     fn screenshot_dimensions_are_checked_before_layout() {
         assert_eq!(viewport_pixels([1600.0, 1000.0], 2.0).unwrap(), [3200, 2000]);
         assert_eq!(viewport_pixels([345.0, 200.0], 0.9).unwrap(), [311, 180]);
-        assert_eq!(viewport_pixels([8000.0, 8000.0], 1.0).unwrap(), [8000, 8000]);
+        // The largest accepted surface is exactly the 128 MiB screenshot budget (32 Mi pixels).
+        assert_eq!(viewport_pixels([16384.0, 2048.0], 1.0).unwrap(), [16384, 2048]);
+        assert_eq!(viewport_pixels([5792.0, 5792.0], 1.0).unwrap(), [5792, 5792]);
         for (size, scale) in [
             ([f32::NAN, 10.0], 1.0),
             ([10.0, f32::INFINITY], 1.0),
@@ -639,6 +681,9 @@ mod tests {
             ([10.0, 10.0], 0.0),
             ([0.0, 10.0], 1.0),
             ([10.0, 10.0], 0.01),
+            ([16384.0, 2049.0], 1.0),
+            ([8000.0, 8000.0], 1.0),
+            ([5793.0, 5793.0], 1.0),
             ([9000.0, 9000.0], 1.0),
             ([9000.0, 100.0], 2.0),
         ] {
@@ -851,7 +896,7 @@ mod tests {
         let (Some(a), Some(b)) = (thumbs.first().cloned(), thumbs.get(1).cloned()) else { panic!("two grid photos: {thumbs:?}") };
         let popup = |w: &str| {
             let id: u64 = w.trim_start_matches("thumb:").parse().expect("a photo id");
-            egui::Id::new(("cell", id)).with("popup")
+            egui::Id::unique(("cell", id)).with("popup")
         };
         assert!(!egui::Popup::is_any_open(&h.view.ctx));
         let r = h.request("ui.clickWidget", json!({"id": a, "button": "right"}), t);
@@ -1524,7 +1569,7 @@ mod tests {
         assert_eq!(names(&h), vec![Some("Jane Doe".into()), None, None, None, None, None, Some("John Roe".into())]);
         // With no target A cannot name a face, even on this page.
         h.request("ui.move", json!({"x": 1, "y": 1}), t);
-        h.view.ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(("more-face-above", ids[2].0, 0_usize))));
+        h.view.ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique(("more-face-above", ids[2].0, 0_usize))));
         set_page(&mut h);
         h.request("ui.key", json!({"key": "a"}), t);
         h.step();
@@ -1552,7 +1597,7 @@ mod tests {
         h.request("ui.move", json!({"x": 1, "y": 1}), t);
         set_page(&mut h);
         // Keyboard focus on the candidate makes the same batch action available without hovering it.
-        h.view.ctx.memory_mut(|m| m.request_focus(egui::Id::new(("more-face", ids[2].0, 0_usize))));
+        h.view.ctx.memory_mut(|m| m.request_focus(egui::Id::unique(("more-face", ids[2].0, 0_usize))));
         h.request("ui.key", json!({"key": "a"}), t);
         h.step();
         assert_eq!(
@@ -2856,17 +2901,36 @@ mod tests {
         assert!(!h.app.ui.visualize_spots);
     }
 
+    /// Bring a right-panel field into the visible panel before clicking it. The Info panel is a
+    /// scroll area: 0.37's roomier text rows push the place fields below a 1000-point window, and a
+    /// click at an off-screen rect would leave the previous field focused.
+    fn click_field_in_view(h: &mut Headless, key: &str, timeout: Duration) {
+        let id = format!("field:{key}");
+        let panel = h.app.widgets.iter().find(|(w, _)| w == "panel:right_panel").map(|(_, r)| *r).expect("the right panel is laid out");
+        let rect = h.app.widgets.iter().find(|(w, _)| *w == id).map(|(_, r)| *r).expect("the field is laid out");
+        if !panel.contains(rect.center()) {
+            let dy = (panel.center().y - rect.center().y).clamp(-4000.0, 4000.0);
+            assert_eq!(h.request("ui.move", json!({"x": panel.center().x, "y": panel.center().y}), timeout)["ok"], true);
+            assert_eq!(h.request("ui.scroll", json!({"dy": dy}), timeout)["ok"], true);
+            h.settle(timeout);
+        }
+        let rect = h.app.widgets.iter().find(|(w, _)| *w == id).map(|(_, r)| *r).expect("the field is laid out");
+        assert!(panel.contains(rect.center()), "the field must be scrolled into view before clicking: {rect:?} in {panel:?}");
+        let r = h.request("ui.clickWidget", json!({"id": id}), timeout);
+        assert_eq!(r["ok"], true, "{r}");
+    }
+
     /// Info panel: typing into a field survives frames and is saved when it loses focus; the new
     /// accessibility and place fields reach the photo.
     #[test]
     fn info_fields_keep_typing_and_save() {
-        let mut h = demo([1300.0, 1000.0]);
+        // (tall enough for the place fields to show without scrolling)
+        let mut h = demo([1300.0, 1200.0]);
         let t = Duration::from_secs(10);
         h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
         h.settle(SETTLE);
         for (key, text) in [("altText", "A lake at dawn"), ("usageTerms", "Editorial use only"), ("city", "Zermatt")] {
-            let r = h.request("ui.clickWidget", json!({"id": format!("field:{key}")}), t);
-            assert_eq!(r["ok"], true, "{r}");
+            click_field_in_view(&mut h, key, t);
             h.request("ui.key", json!({"key": "A", "cmd": true}), t);
             h.request("ui.text", json!({"text": text}), t);
             h.step();
@@ -2924,6 +2988,291 @@ mod tests {
         ask(&mut h, "ui.clickWidget", json!({"id": "field:title:paste"}));
         ask(&mut h, "ui.key", json!({"key": "Enter"}));
         assert_eq!(meta(&h).title, "Wedding in Sintra");
+    }
+
+    /// With several photos selected the Info panel offers Target Photo / Selected Photos. Target
+    /// Photo (the default) shows the active photo's values. Selected Photos leaves a field whose
+    /// values differ empty, so what is typed there is what every selected photo gets, and keeps
+    /// the value of a field they share; leaving a mixed field untouched saves nothing.
+    #[test]
+    fn info_shows_metadata_for_the_selected_photos() {
+        let mut h = demo([1300.0, 1000.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+            r
+        };
+        let exec = |h: &mut Headless, command: &str, params: serde_json::Value| {
+            ask(h, "engine.execute", json!({"command": command, "params": params}))["result"].clone()
+        };
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(2).map(|p| p.0).collect();
+        let (a, b) = (lightcraft_catalog::PhotoId(ids[0]), lightcraft_catalog::PhotoId(ids[1]));
+        let meta = |h: &Headless, id| h.app.session.catalog.photo(id).unwrap().meta.clone();
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "title": "Dawn", "copyrightStatus": "copyrighted"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[1]], "title": "Dusk"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": ids, "creator": "Ana"}));
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        exec(&mut h, "library.select", json!({"ids": ids, "active": ids[0]}));
+        h.settle(SETTLE);
+        let buttons = |h: &mut Headless| h.request("ui.widgets", json!({"filter": "infoFor"}), t)["result"].to_string();
+        assert!(buttons(&mut h).contains("button:infoFor-selected"), "the choice shows with two photos selected");
+        assert!(h.app.ui.settings.info_selected_photos, "Selected Photos by default");
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "title": "Dawn!"}));
+        // Target Photo and back to Selected Photos, from their buttons
+        ask(&mut h, "ui.clickWidget", json!({"id": "button:infoFor-target"}));
+        assert!(!h.app.ui.settings.info_selected_photos);
+        ask(&mut h, "ui.clickWidget", json!({"id": "button:infoFor-selected"}));
+        assert!(h.app.ui.settings.info_selected_photos);
+        // a mixed field left untouched saves nothing
+        let undo = h.app.session.undo.len();
+        click_field_in_view(&mut h, "title", t);
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((meta(&h, a).title, meta(&h, b).title, h.app.session.undo.len()), ("Dawn!".into(), "Dusk".into(), undo));
+        // neither does switching the choice while a field is being edited, either way
+        for on in [false, true] {
+            click_field_in_view(&mut h, "title", t);
+            exec(&mut h, "view.infoSelectedPhotos", json!({"on": on}));
+            ask(&mut h, "ui.key", json!({"key": "Tab"}));
+            h.settle(SETTLE);
+            assert_eq!((meta(&h, a).title, meta(&h, b).title, h.app.session.undo.len()), ("Dawn!".into(), "Dusk".into(), undo), "{on}");
+        }
+        // the mixed title starts empty; the shared creator keeps its value
+        for (key, typed, want) in [("title", "Harbor", "Harbor"), ("creator", " Silva", "Ana Silva")] {
+            click_field_in_view(&mut h, key, t);
+            ask(&mut h, "ui.key", json!({"key": "End"}));
+            ask(&mut h, "ui.text", json!({"text": typed}));
+            ask(&mut h, "ui.key", json!({"key": "Tab"}));
+            h.settle(SETTLE);
+            let got = |h: &Headless, id| if key == "title" { meta(h, id).title } else { meta(h, id).creator };
+            assert_eq!((got(&h, a), got(&h, b)), (want.to_string(), want.to_string()), "{key}");
+        }
+        // a mixed field typed in and left empty clears it on every selected photo
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "caption": "Old"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[1]], "caption": "Other"}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "caption", t);
+        ask(&mut h, "ui.text", json!({"text": "x"}));
+        ask(&mut h, "ui.key", json!({"key": "Backspace"}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((meta(&h, a).caption, meta(&h, b).caption), (String::new(), String::new()));
+        // GPS: one photo's place and Show on Map only while the selected photos share it
+        let map = |h: &mut Headless| h.request("ui.widgets", json!({"filter": "showOnMap"}), t)["result"].to_string().contains("showOnMap");
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "gps": [41.15, -8.61]}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[1]], "gps": [38.72, -9.14]}));
+        h.settle(SETTLE);
+        assert!(!map(&mut h), "places differ");
+        exec(&mut h, "photo.setMeta", json!({"ids": ids, "gps": [41.15, -8.61]}));
+        h.settle(SETTLE);
+        assert!(map(&mut h), "a shared place");
+        // the command: refuses a value that isn't true or false, and turns Target Photo back on
+        let r = h.request("engine.execute", json!({"command": "view.infoSelectedPhotos", "params": {"on": "yes"}}), t);
+        assert_ne!(r["ok"], true, "{r}");
+        assert!(h.app.ui.settings.info_selected_photos);
+        assert_eq!(exec(&mut h, "view.infoSelectedPhotos", json!({"on": false}))["on"], false);
+        assert!(!h.app.ui.settings.info_selected_photos);
+        assert_eq!(exec(&mut h, "view.infoSelectedPhotos", json!({}))["on"], true, "no params toggles");
+        // the choice is saved with the app settings; settings saved before it read as Selected Photos
+        exec(&mut h, "view.infoSelectedPhotos", json!({"on": false}));
+        let saved = serde_json::to_value(&h.app.ui.settings).unwrap();
+        assert_eq!(saved["infoSelectedPhotos"], false);
+        let read: crate::state::AppSettings = serde_json::from_value(saved).unwrap();
+        assert!(!read.info_selected_photos);
+        let old: crate::state::AppSettings = serde_json::from_value(json!({"filmNames": false})).unwrap();
+        assert!(old.info_selected_photos);
+        // one photo selected: no choice to make
+        exec(&mut h, "library.select", json!({"ids": [ids[0]]}));
+        h.settle(SETTLE);
+        assert!(!buttons(&mut h).contains("infoFor-"), "{}", buttons(&mut h));
+    }
+
+    /// With several photos selected and the settings as they come, an edit to a field where the
+    /// photos differ starts from an empty field: the photos get what was typed, not the active
+    /// photo's value with the typing added.
+    #[test]
+    fn info_edits_of_a_multi_selection_start_from_mixed_fields_by_default() {
+        let mut h = demo([1300.0, 1000.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+        };
+        let exec = |h: &mut Headless, command: &str, params: serde_json::Value| {
+            ask(h, "engine.execute", json!({"command": command, "params": params}));
+        };
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(2).map(|p| p.0).collect();
+        let caption = |h: &Headless, i: usize| h.app.session.catalog.photo(lightcraft_catalog::PhotoId(ids[i])).unwrap().meta.caption.clone();
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "caption": "Dawn"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[1]], "caption": "Dusk"}));
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        exec(&mut h, "library.select", json!({"ids": ids, "active": ids[0]}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "caption", t);
+        ask(&mut h, "ui.key", json!({"key": "End"}));
+        ask(&mut h, "ui.text", json!({"text": "Harbor"}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((caption(&h, 0), caption(&h, 1)), ("Harbor".into(), "Harbor".into()));
+    }
+
+    /// Target Photo edits the photo it shows: with several photos selected, a field's edit is
+    /// saved to the active photo alone.
+    #[test]
+    fn info_target_photo_edits_only_the_photo_it_shows() {
+        let mut h = demo([1300.0, 1000.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+        };
+        let exec = |h: &mut Headless, command: &str, params: serde_json::Value| {
+            ask(h, "engine.execute", json!({"command": command, "params": params}));
+        };
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(2).map(|p| p.0).collect();
+        let caption = |h: &Headless, i: usize| h.app.session.catalog.photo(lightcraft_catalog::PhotoId(ids[i])).unwrap().meta.caption.clone();
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0]], "caption": "Dawn"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[1]], "caption": "Dusk"}));
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        exec(&mut h, "library.select", json!({"ids": ids, "active": ids[0]}));
+        exec(&mut h, "view.infoSelectedPhotos", json!({"on": false}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "caption", t);
+        ask(&mut h, "ui.key", json!({"key": "End"}));
+        ask(&mut h, "ui.text", json!({"text": "!"}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((caption(&h, 0), caption(&h, 1)), ("Dawn!".into(), "Dusk".into()));
+    }
+
+    /// The fields the Info panel marks as mixed: each text field, the copyright status and GPS
+    /// where a selected photo differs from the photo the panel shows, and none for one photo.
+    #[test]
+    fn info_mixed_fields_are_the_ones_that_differ() {
+        let mut s = lightcraft_engine::Session::with_demo();
+        let ids: Vec<u64> = s.visible_cloned().iter().take(3).map(|p| p.0).collect();
+        let all = |key: &str, v: serde_json::Value| json!({"ids": ids, key: v});
+        // (every field the panel compares starts the same on the three photos)
+        let fields = [
+            "title",
+            "caption",
+            "altText",
+            "extendedDescription",
+            "copyright",
+            "usageTerms",
+            "copyrightUrl",
+            "creator",
+            "location",
+            "state",
+            "country",
+        ];
+        for key in fields {
+            s.execute("photo.setMeta", &all(key, json!(""))).unwrap();
+        }
+        for (key, v) in
+            [("title", json!("Same")), ("city", json!("Porto")), ("copyrightStatus", json!("copyrighted")), ("gps", json!([41.15, -8.61]))]
+        {
+            s.execute("photo.setMeta", &all(key, v)).unwrap();
+        }
+        let photos: Vec<lightcraft_catalog::PhotoId> = ids.iter().map(|&i| lightcraft_catalog::PhotoId(i)).collect();
+        let shown = s.catalog.photo(photos[0]).unwrap().meta.clone();
+        assert!(crate::panels::right::mixed_meta(&s.catalog, &photos, &shown).is_empty());
+        assert!(crate::panels::right::mixed_meta(&s.catalog, &photos[..1], &shown).is_empty());
+        s.execute("photo.setMeta", &json!({"ids": [ids[2]], "city": "Lisbon", "caption": "x", "gps": [38.72, -9.14]})).unwrap();
+        s.execute("photo.setMeta", &json!({"ids": [ids[1]], "copyrightStatus": "publicDomain"})).unwrap();
+        let mut mixed = crate::panels::right::mixed_meta(&s.catalog, &photos, &shown);
+        mixed.sort_unstable();
+        assert_eq!(mixed, ["caption", "city", "copyrightStatus", "gps"]);
+    }
+
+    /// Selected Photos with the active photo outside the selection: the fields show what the
+    /// selected photos share, not the active photo's values.
+    #[test]
+    fn info_selected_photos_ignore_an_active_photo_outside_the_selection() {
+        let mut h = demo([1300.0, 1000.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+        };
+        let exec = |h: &mut Headless, command: &str, params: serde_json::Value| {
+            ask(h, "engine.execute", json!({"command": command, "params": params}));
+        };
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(3).map(|p| p.0).collect();
+        let title = |h: &Headless, i: usize| h.app.session.catalog.photo(lightcraft_catalog::PhotoId(ids[i])).unwrap().meta.title.clone();
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[0], ids[1]], "title": "Same"}));
+        exec(&mut h, "photo.setMeta", json!({"ids": [ids[2]], "title": "Other"}));
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        exec(&mut h, "library.select", json!({"ids": [ids[0], ids[1]], "active": ids[2]}));
+        exec(&mut h, "view.infoSelectedPhotos", json!({"on": true}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "title", t);
+        ask(&mut h, "ui.key", json!({"key": "End"}));
+        ask(&mut h, "ui.text", json!({"text": "!"}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((title(&h, 0), title(&h, 1), title(&h, 2)), ("Same!".into(), "Same!".into(), "Other".into()));
+    }
+
+    /// An Info field saves to the photos selected when its edit started, also when the selection
+    /// changes while the field is being edited.
+    #[test]
+    fn info_field_saves_to_the_photos_selected_when_the_edit_started() {
+        // (tall enough for the GPS field to show without scrolling)
+        let mut h = demo([1300.0, 1800.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+        };
+        let exec = |h: &mut Headless, command: &str, params: serde_json::Value| {
+            ask(h, "engine.execute", json!({"command": command, "params": params}));
+        };
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(4).map(|p| p.0).collect();
+        let meta = |h: &Headless, i: usize| h.app.session.catalog.photo(lightcraft_catalog::PhotoId(ids[i])).unwrap().meta.clone();
+        exec(&mut h, "photo.setMeta", json!({"ids": ids, "title": "Same", "gps": ""}));
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        exec(&mut h, "library.select", json!({"ids": [ids[0], ids[1]], "active": ids[0]}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "title", t);
+        ask(&mut h, "ui.key", json!({"key": "End"}));
+        ask(&mut h, "ui.text", json!({"text": "!"}));
+        exec(&mut h, "library.select", json!({"ids": [ids[2]]}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((meta(&h, 0).title, meta(&h, 1).title, meta(&h, 2).title), ("Same!".into(), "Same!".into(), "Same".into()));
+        // GPS too (the new selection is two photos as well, so the panel keeps its layout)
+        exec(&mut h, "library.select", json!({"ids": [ids[0], ids[1]], "active": ids[0]}));
+        h.settle(SETTLE);
+        click_field_in_view(&mut h, "gps", t);
+        ask(&mut h, "ui.text", json!({"text": "41.15, -8.61"}));
+        exec(&mut h, "library.select", json!({"ids": [ids[2], ids[3]], "active": ids[2]}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        let gps: Vec<bool> = (0..4).map(|i| meta(&h, i).gps.is_some()).collect();
+        assert_eq!(gps, [true, true, false, false]);
+        // Esc gives a GPS edit up
+        exec(&mut h, "library.select", json!({"ids": [ids[0], ids[1]], "active": ids[0]}));
+        h.settle(SETTLE);
+        let before = meta(&h, 0).gps;
+        click_field_in_view(&mut h, "gps", t);
+        ask(&mut h, "ui.key", json!({"key": "End"}));
+        ask(&mut h, "ui.text", json!({"text": "5"}));
+        ask(&mut h, "ui.key", json!({"key": "Escape"}));
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        h.settle(SETTLE);
+        assert_eq!((meta(&h, 0).gps, meta(&h, 1).gps), (before, before));
     }
 
     /// Local: a folder's photos show without joining the library; the breadcrumb, Include
@@ -4273,7 +4622,7 @@ mod tests {
         // Paint the edited template before locating the Tags button in the resized dialog.
         assert!(h.settle(SETTLE), "Copy dialog layout should settle before locating Tags");
         // the cursor sits after "Trip-"
-        let id = egui::Id::new("import-rename");
+        let id = egui::Id::unique("import-rename");
         let mut st = egui::text_edit::TextEditState::default();
         st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(5))));
         st.store(&h.view.ctx, id);
@@ -4310,7 +4659,7 @@ mod tests {
             let r = h.request("ui.clickWidget", json!({"id": format!("button:aboutTab-{tab}")}), t);
             assert_eq!(r["ok"], true, "{tab}: {r}");
             h.step();
-            let shown = h.view.ctx.data_mut(|d| d.get_temp::<u8>(egui::Id::new("about_tab")));
+            let shown = h.view.ctx.data_mut(|d| d.get_temp::<u8>(egui::Id::unique("about_tab")));
             assert_eq!(shown.map(usize::from), Some(i), "{tab}");
         }
         h.request("ui.clickWidget", json!({"id": "button:aboutTab-contributors"}), t);
@@ -4634,6 +4983,53 @@ mod tests {
         assert_eq!(h.app.ui.settings.loupe_info.info2, [F::Camera, F::None, F::FileName], "a refused change changes nothing");
     }
 
+    /// View Options' Show Briefly When Photo Changes: a tick box under each Info (ticking one
+    /// unticks the other) and `view.viewOptions {briefly}`; with the overlay off, the loupe shows
+    /// the chosen Info after → changes the photo, and hides it again a few seconds later.
+    #[test]
+    fn show_briefly_when_photo_changes_in_view_options() {
+        use crate::state::{BRIEF_INFO_SECS, InfoOverlay};
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        assert_eq!(h.request("ui.key", json!({"key": "j", "cmd": true}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "check:viewOptions.briefly2"}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.app.ui.settings.loupe_info.briefly, InfoOverlay::Exposure);
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "check:viewOptions.briefly1"}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.app.ui.settings.loupe_info.briefly, InfoOverlay::Basic, "one Info at most");
+        h.app.ui.dialog = None;
+        h.step();
+
+        let overlay = |h: &Headless| h.app.widgets.iter().any(|(w, _)| w == "canvas:infoOverlay");
+        assert_eq!(h.app.ui.info_overlay, InfoOverlay::Off);
+        h.time += BRIEF_INFO_SECS + 1.0;
+        h.step();
+        h.step();
+        assert!(!overlay(&h), "hidden once the time has passed");
+        let before = h.app.session.active();
+        h.request("ui.key", json!({"key": "right"}), t);
+        assert_ne!(h.app.session.active(), before);
+        h.step();
+        assert!(overlay(&h), "shown after → changes the photo");
+        h.time += BRIEF_INFO_SECS + 1.0;
+        h.step();
+        h.step();
+        assert!(!overlay(&h), "and hidden again");
+
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"briefly": "off"}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["result"]["loupeInfo"]["briefly"], "off", "{r}");
+        h.request("ui.key", json!({"key": "right"}), t);
+        h.step();
+        assert!(!overlay(&h), "off: nothing shows when the photo changes");
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"briefly": "info3"}}), t);
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(h.app.ui.settings.loupe_info.briefly, InfoOverlay::Off, "a refused change changes nothing");
+    }
+
     /// A click on the image zooms to the chosen click-zoom ratio (1:1 by default), animating the
     /// loupe while rendering once at the final size; Z uses the same ratio; a second click returns to Fit.
     #[test]
@@ -4739,6 +5135,7 @@ mod tests {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(10.0, -10.0),
                     phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                     modifiers: egui::Modifiers::NONE,
                 }),
                 None,
@@ -4817,7 +5214,13 @@ mod tests {
         ] {
             h.request("ui.set", json!({"zoom": "fit", "pan": [0.5, 0.5]}), t);
             h.request("ui.hoverWidget", json!({"id": "canvas:image"}), t);
-            h.app.synthetic.push(egui::Event::MouseWheel { unit, delta: egui::vec2(0.0, y), phase: egui::TouchPhase::Move, modifiers });
+            h.app.synthetic.push(egui::Event::MouseWheel {
+                unit,
+                delta: egui::vec2(0.0, y),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers,
+            });
             for _ in 0..10 {
                 h.step();
             }
@@ -4968,6 +5371,69 @@ mod tests {
         open.set(true);
         assert!(h.step_until(SETTLE, |h| !pill(h)), "gone once the render lands");
         assert!(!h.app.renderer.is_pending(Slot::Main));
+    }
+
+    /// View Options' Show message when loading or rendering photos (on by default): turned off in
+    /// the window, the loupe does not say "Rendering…" while an edit renders; `view.viewOptions
+    /// {loupeMessages}` turns it back on for an agent (refusing a value that is not true or false).
+    #[test]
+    fn view_options_turn_the_rendering_message_off() {
+        use crate::render::Slot;
+        use std::{cell::Cell, rc::Rc};
+        let pill = |h: &Headless| h.app.widgets.iter().any(|(w, _)| w == "loupe:rendering");
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "none"}), t);
+        h.settle(SETTLE);
+        assert!(h.app.ui.settings.loupe_messages, "on by default");
+        assert_eq!(h.request("ui.key", json!({"key": "j", "cmd": true}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "check:viewOptions.loupeMessages"}), t)["ok"], true);
+        h.step();
+        assert!(!h.app.ui.settings.loupe_messages, "the tick box turns it off");
+        h.app.ui.dialog = None;
+        let open = Rc::new(Cell::new(false));
+        h.app.renderer.set_offload(Box::new(super::RenderGate::new(open.clone())));
+        h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": 0.5}}), t);
+        for _ in 0..45 {
+            h.step();
+        }
+        assert!(h.app.renderer.is_pending(Slot::Main), "the edit's render is held");
+        assert!(!pill(&h), "no message while it is off");
+
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"loupeMessages": "yes"}}), t);
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(!h.app.ui.settings.loupe_messages, "a refused change changes nothing");
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"loupeMessages": true}}), t);
+        assert_eq!(r["result"]["loupeMessages"], true, "{r}");
+        assert_eq!(h.app.ui.dialog, None, "a value sets it without opening the window");
+        assert!(h.step_until(SETTLE, pill), "the message shows again while the render is held");
+        open.set(true);
+        assert!(h.step_until(SETTLE, |h| !pill(h)), "gone once the render lands");
+    }
+
+    /// With nothing to show yet, the loupe says "Rendering…" in its middle only while View Options'
+    /// Show message when loading or rendering photos is on.
+    #[test]
+    fn an_empty_loupe_says_rendering_only_with_the_message_on() {
+        use std::{cell::Cell, rc::Rc};
+        for on in [true, false] {
+            let mut h = demo([1000.0, 700.0]);
+            let t = Duration::from_secs(10);
+            h.app.ui.settings.loupe_messages = on;
+            h.app.renderer.set_offload(Box::new(super::RenderGate::new(Rc::new(Cell::new(false)))));
+            h.request("ui.set", json!({"view": "detail", "right": "none"}), t);
+            // drop every texture (quick previews and thumbnails land outside the gate) until a
+            // frame has nothing to show
+            let empty = (0..60).any(|_| {
+                h.app.renderer.textures.clear();
+                h.step();
+                h.app.loupe_shown.map(|l| l.1) == Some("none")
+            });
+            assert!(empty, "a frame with nothing rendered");
+            let said = h.painted_text().iter().any(|text| text == "Rendering…");
+            assert_eq!(said, on, "message on: {on}");
+        }
     }
 
     /// A render that fails while the loupe shows a stand-in (the embedded JPEG, a thumbnail) left
