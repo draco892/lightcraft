@@ -21,8 +21,9 @@ chrono = { workspace = true }
 web-time = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-same-file = { workspace = true }
+winapi-util = { workspace = true }
 
 [dev-dependencies]
 lightcraft-geom = { workspace = true }
+lightcraft-testkit = { workspace = true }
 proptest = { workspace = true }

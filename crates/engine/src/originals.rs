@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(any(unix, windows)))]
 use std::time::SystemTime;
 
-use lightcraft_catalog::safe_file::same_file;
+use lightcraft_catalog::safe_file::same_file_strict;
 use lightcraft_catalog::{Catalog, Source};
 
 /// The directory entry a screenshot is about to write, pinned at request admission.
@@ -145,7 +145,7 @@ impl OriginalGuard {
             Err(error) => return Err(format!("{}: cannot inspect write target: {error}", target.display())),
             Ok(_) => {}
         }
-        let matches = |original: &Path, what: &str| match same_file(original, target) {
+        let matches = |original: &Path, what: &str| match same_file_strict(original, target) {
             // Offline originals and sidecars that were never written have no existing file
             // to protect. Confirm the missing candidate; do not suppress errors on the target.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && original.try_exists().is_ok_and(|exists| !exists) => Ok(false),
@@ -292,11 +292,11 @@ mod tests {
         session.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
 
         // FILE_SHARE_DELETE allows replacement while withholding read sharing. Metadata can
-        // still be inspected, but same-file's read-only handle fails with a sharing violation.
+        // still be inspected, but the identity reader's handle fails with a sharing violation.
         let held = std::fs::OpenOptions::new().read(true).share_mode(4).open(&original).unwrap();
         for (path, target) in targets.iter().zip(&queued) {
             assert!(std::fs::symlink_metadata(path).is_ok());
-            assert!(same_file(&original, path).is_err(), "identity must actually be unavailable");
+            assert!(same_file_strict(&original, path).is_err(), "identity must actually be unavailable");
             let admission = session.pin_write_target(&path.to_string_lossy()).unwrap_err();
             assert!(admission.contains("cannot verify file identity"), "{admission}");
             let revalidation = session.revalidate_write_target(target).unwrap_err();
@@ -402,6 +402,34 @@ mod tests {
             symlink(&original, &link).unwrap();
             assert!(s.pin_write_target(&link.to_string_lossy()).unwrap_err().contains("original"));
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_hard_link_whose_identity_cannot_be_read_is_refused() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = std::env::temp_dir().join(format!("lc-unreadable-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut s = crate::Session::new();
+        let original = d.join("IMG_1.jpg");
+        std::fs::write(&original, b"original").unwrap();
+        let photo = Photo::new(PhotoId(1), Source::File { path: original.to_string_lossy().to_string() }, "IMG_1.jpg", "JPEG", 10, 10, "2026-01-01");
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+        let linked = d.join("shot.png");
+        std::fs::hard_link(&original, &linked).unwrap();
+
+        // A handle that shares nothing makes every other open of the file fail, so the file
+        // identity of either name cannot be read while it is held.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&original).unwrap();
+        let refused = s.pin_write_target(&linked.to_string_lossy()).unwrap_err();
+        assert!(refused.contains("cannot verify file identity"), "{refused}");
+        drop(held);
+
+        let refused = s.pin_write_target(&linked.to_string_lossy()).unwrap_err();
+        assert!(refused.contains("original"), "{refused}");
+        assert!(!refused.contains("cannot verify file identity"), "{refused}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
