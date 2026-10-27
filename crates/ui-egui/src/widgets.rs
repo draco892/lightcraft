@@ -1111,9 +1111,15 @@ pub(crate) fn elide_head(text: &str, max: f32, width: impl Fn(&str) -> f32) -> S
     "…".to_string()
 }
 
+pub mod album_picker;
+pub mod button;
+pub mod date_picker;
 #[cfg(test)]
 #[path = "widgets/tests_numeric_entry.rs"]
 mod numeric_entry_tests;
+pub mod progress;
+pub mod rating;
+pub mod text_field;
 
 #[cfg(test)]
 #[path = "widgets/tests_slider_reset.rs"]

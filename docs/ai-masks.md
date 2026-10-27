@@ -115,7 +115,7 @@ The model is fetched from an ordered list of mirrors: base URLs where `<base>/mo
 2. the file `models/sam3-mirrors.txt` in LightCraft's settings folder (one URL per line, `#`
    comments) — `~/Library/Application Support/LightCraft/` (macOS), `%APPDATA%\LightCraft\`
    (Windows), `~/.config/lightcraft/` (Linux);
-3. the built-in list, `DEFAULT_MIRRORS` in `crates/segment/src/fetch/mod.rs`.
+3. the built-in list, `DEFAULT_MIRRORS` in `crates/segment/src/fetch.rs`.
 
 > **Maintainers:** the built-in list is **empty** until LightCraft's own CDN locations exist
 > (see the `TODO(maintainer)` there): add them in order of preference, host the three files

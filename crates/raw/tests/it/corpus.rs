@@ -1142,7 +1142,7 @@ fn nikon_in_file_distortion_is_limited_to_validated_bodies() {
     eprintln!("Nikon distortion boundary: {checked} corpus files checked");
 }
 
-/// The Sony samples of the corpus manifest (`RAW_SAMPLES` in `xtask/src/main.rs`) with their pinned SHA-256.
+/// The Sony samples of the corpus manifest (`RAW_SAMPLES` in `xtask/src/raw_samples.rs`) with their pinned SHA-256.
 const SONY_SAMPLES: &[(&str, &str)] = &[
     ("arw-sony-a7rm4a-compressed.arw", "690c774f1d7bc1db3fa8c2489762743d8e7586e50b6f65d0b6a61cb467972c67"),
     ("arw-sony-a9m2-compressed.arw", "161c2a9da2b5f1e50be6117a0b4da0ce249660b5d7de13568d301c4034716b97"),
@@ -1203,7 +1203,7 @@ fn sony_pins_match_the_corpus_manifest() {
     lines.sort();
     let digest: String = Sha256::digest(lines.concat()).iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(digest, SONY_PINS_SHA256, "the pinned Sony SHA-256 table changed: check every changed pin against its file, then update the anchor");
-    let manifest = include_str!("../../../../xtask/src/main.rs");
+    let manifest = include_str!("../../../../xtask/src/raw_samples.rs");
     for (name, sha) in SONY_SAMPLES {
         let entry = manifest.find(&format!("\"{name}\"")).unwrap_or_else(|| panic!("{name} is not in the manifest"));
         assert!(manifest[entry..].split_once("),").is_some_and(|(e, _)| e.contains(sha)), "{name}: pinned SHA-256 differs from the manifest");

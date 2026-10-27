@@ -1,7 +1,6 @@
 //! Photo Grid (justified rows) and Square Grid. Virtualized: only visible cells request thumbnails.
 
 #[cfg(test)]
-#[path = "grid_header_tests.rs"]
 mod header_tests;
 
 use std::collections::{HashMap, HashSet};
@@ -711,6 +710,15 @@ pub fn request_thumb(app: &mut LightcraftApp, id: PhotoId, size: usize, priority
     {
         return;
     }
+    // Several cells can show one photo at different sizes (a print page's cells). Before any
+    // thumbnail arrives, a caller at another bucket would replace the pending request every frame
+    // and restart it, so none of them ever gets a picture: keep the request in flight. A higher
+    // priority caller may take it over once; the caller it replaced then coalesces behind it.
+    if let Some(photo) = app.session.catalog.photo(id)
+        && app.renderer.thumb_pending_other_bucket(photo, bucket, priority)
+    {
+        return;
+    }
     let Some(job) = app.session.thumb_job(id, size) else { return };
     #[cfg(test)]
     {
@@ -723,9 +731,9 @@ pub fn request_thumb(app: &mut LightcraftApp, id: PhotoId, size: usize, priority
         quick.is_some() && app.session.catalog.photo(id).is_some_and(|p| skips_the_real_render(app.session.embedded_thumb_is_final(p), true));
     if let Some(photo) = app.session.catalog.photo(id) {
         if embedded_is_final {
-            app.renderer.remember_embedded_thumb(photo, bucket, job.key);
+            app.renderer.remember_embedded_thumb(photo, bucket, job.key, priority);
         } else {
-            app.renderer.remember_thumb(photo, bucket, job.key, quick.is_some());
+            app.renderer.remember_thumb(photo, bucket, job.key, quick.is_some(), priority);
         }
     }
     match quick {

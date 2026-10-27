@@ -2,10 +2,13 @@
 #
 # Flatpak builds run offline, so the crate sources must be vendored first. From the repo root:
 #
-#   curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
-#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/linux/flatpak/cargo-sources.json
+#   ./packaging/linux/flatpak/generate-cargo-sources.py
 #   flatpak-builder --user --install --force-clean build-flatpak packaging/linux/flatpak/ai.storyteller.lightcraft.yml
 #   flatpak run ai.storyteller.lightcraft
+#
+# The wrapper downloads the pinned upstream flatpak-cargo-generator, verifies its checksum,
+# applies the two reviewed patches described in packaging/linux/flatpak/README.md, and writes
+# cargo-sources.json atomically. That README also covers dependencies and offline validation.
 #
 # For Flathub, replace the `dir` source with a `git` source pinned to a release tag and commit.
 #

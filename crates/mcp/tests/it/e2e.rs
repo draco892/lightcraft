@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use lightcraft_mcp::{Backend, Headless, ProgressHook, Remote, Server, base64_decode};
+use lightcraft_mcp::{Backend, Headless, ProgressHook, Remote, Server, base64_decode, call_tool};
 use serde_json::{Value, json};
 
 /// Feed a whole session through `Server::serve` and return the replies by id.
@@ -184,6 +184,28 @@ fn remote_unreachable_is_a_tool_error() {
     assert!(r[0]["result"]["content"][0]["text"].as_str().unwrap().contains("not reachable"));
 }
 
+/// Eight distinct 1200×800 PNGs on disk, imported into a filesystem session with their real
+/// metadata: a library of actual files for the batch export to read and develop. Generating the
+/// procedural 6000×4000 demo library (and rendering from it) costs far more than this test's
+/// contract — progress, cancellation and atomic 1200-edge PNG writes — needs.
+fn file_backed_photos(dir: &std::path::Path) -> Headless {
+    let originals = dir.join("originals");
+    std::fs::create_dir_all(&originals).unwrap();
+    let mut paths = Vec::new();
+    for i in 0..8usize {
+        let path = originals.join(format!("frame-{i:02}.png"));
+        let img = lightcraft_raster::Rgba8::from_fn(1200, 800, |x, y| {
+            [((x + i * 37) % 256) as u8, ((y * 3 + i * 11) % 256) as u8, ((x / 4 + y / 2 + i * 23) % 256) as u8, 255]
+        });
+        lightcraft_mcp::write_image(&path, &img, 90).unwrap();
+        paths.push(path.to_string_lossy().to_string());
+    }
+    let mut headless = Headless::new(lightcraft_engine::Session::new().with_fs());
+    let imported = call_tool(&mut headless, "import", &json!({"paths": paths}));
+    assert!(!imported.is_error, "{imported:?}");
+    headless
+}
+
 /// [`Headless`] whose batch export, while `hold` is set, waits once its first photo is written:
 /// it keeps asking the server's progress hook at that photo boundary (which answers pings and
 /// reads cancels meanwhile) until the request is cancelled or the test clears `hold`. A ping or
@@ -236,7 +258,7 @@ fn export_progress_and_cancel() {
     let (input, mut send) = std::io::pipe().unwrap();
     let (output, write) = std::io::pipe().unwrap();
     let hold = Arc::new(AtomicBool::new(true));
-    let backend = HoldAfterFirst { inner: Headless::demo(), hold: hold.clone() };
+    let backend = HoldAfterFirst { inner: file_backed_photos(&dir), hold: hold.clone() };
     let server = std::thread::spawn(move || Server::new(Box::new(backend)).serve(BufReader::new(input), write).unwrap());
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -250,8 +272,16 @@ fn export_progress_and_cancel() {
     let next = || rx.recv_timeout(Duration::from_secs(30)).expect("MCP reply/progress");
     writeln!(send, "{}", call(1, "query_photos", json!({"limit":8}))).unwrap();
     let query = next();
-    let ids: Vec<_> = query["result"]["structuredContent"]["photos"].as_array().unwrap().iter().map(|p| p["id"].clone()).collect();
-    assert_eq!(ids.len(), 8);
+    let photos = query["result"]["structuredContent"]["photos"].as_array().unwrap();
+    assert_eq!(photos.len(), 8);
+    // Real files, real metadata: eight distinct 1200×800 PNGs probed from disk, not synthesized.
+    let names: std::collections::HashSet<&str> = photos.iter().map(|p| p["fileName"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 8, "{names:?}");
+    for p in photos {
+        assert_eq!((p["width"].as_u64(), p["height"].as_u64()), (Some(1200), Some(800)), "{p}");
+        assert_eq!(p["format"], "PNG", "{p}");
+    }
+    let ids: Vec<_> = photos.iter().map(|p| p["id"].clone()).collect();
     let mut request = call(2, "export", json!({"ids":ids,"dir":dir.join("complete"),"longEdge":1200,"format":"png"}));
     request["params"]["_meta"] = json!({"progressToken":"photos","io.modelcontextprotocol/protocolVersion":"2026-07-28"});
     writeln!(send, "{request}").unwrap();
@@ -314,10 +344,24 @@ fn export_progress_and_cancel() {
     let photos: Vec<_> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().path()).filter(|p| *p != decoy).collect();
     assert_eq!(photos.len(), 1, "only the photo completed before the cancel remains: {photos:?}");
     for path in &photos {
-        lightcraft_codecs::decode(&std::fs::read(path).unwrap(), Default::default()).expect("complete image, no partial/temp file");
+        let d = lightcraft_codecs::decode(&std::fs::read(path).unwrap(), Default::default()).expect("complete image, no partial/temp file");
+        assert_eq!((d.width, d.height), (1200, 800), "{}", path.display());
     }
-    assert_eq!(std::fs::read_dir(dir.join("complete")).unwrap().count(), 8, "earlier export retained");
+    // The finished export's eight outputs are real 1200×800 PNGs, one per distinct original.
+    let complete: Vec<_> = std::fs::read_dir(dir.join("complete")).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(complete.len(), 8, "earlier export retained: {complete:?}");
+    let mut exported = std::collections::HashSet::new();
+    for path in &complete {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[1..4], b"PNG", "{}", path.display());
+        let d = lightcraft_codecs::decode(&bytes, Default::default()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!((d.width, d.height), (1200, 800), "{}", path.display());
+        exported.insert(bytes);
+    }
+    assert_eq!(exported.len(), 8, "eight distinct outputs, not copies of one export");
     drop(send);
+    // The fixture's files stay in place until the server (which owns the session) and the reader
+    // have finished: the session reads the originals; the output is what the checks above read.
     server.join().unwrap();
     reader.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();

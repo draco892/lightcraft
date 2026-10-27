@@ -59,7 +59,7 @@ packets between scans are not supported by manual JPEG rereading.
 Packet completeness is stricter than the shared best-effort JPEG extractor; it is not strict whole-JPEG
 validation. A complete early XMP packet can be returned without examining the remaining file. Import and
 `photo.allMetadata` retain their existing extraction paths. Command regressions in
-`crates/engine/src/tests_xmp.rs` cover metadata/undo and sidecar precedence, an over-nested XMP packet and a
+`crates/engine/src/tests/xmp.rs` cover metadata/undo and sidecar precedence, an over-nested XMP packet and a
 truncated APP1 without an XMP signature. Separate reader cases in `sidecar::jpeg_header_tests` use small
 counted readers and injected limits for span/step boundaries, complete versus truncated APP1, early stopping,
 short reads and I/O errors.
